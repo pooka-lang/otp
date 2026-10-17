@@ -1,0 +1,422 @@
+//// A typed `gen_server`.
+////
+//// A server is a process that keeps a piece of state and changes it one
+//// message at a time. You describe it with two functions:
+////
+//// - `init` makes the first state. It is given the server's own subject, so
+////   the server can send itself messages later, such as timer ticks.
+//// - `handle` takes the state and one message, and says what happens next:
+////   carry on with a new state, stop, or fail.
+////
+//// ```pooka
+//// import pooka/otp.{Subject}
+//// import pooka/otp/server.{Next}
+////
+//// class Counter {}
+////
+//// class Add(amount: Int) is Counter
+////
+//// class Total(reply: Subject(Int)) is Counter
+////
+//// handle(total: Int, message: Counter) -> Next(Int) {
+////   match message {
+////     Add(amount) -> server.next(total + amount)
+////     Total(reply) -> {
+////       otp.send(reply, total)
+////       server.next(total)
+////     }
+////   }
+//// }
+////
+//// main() {
+////   let assert Ok(counter) = server.start(server.spec(fn(_) { Ok(0) }, handle))
+////   server.send(counter, Add(5))
+////   echo server.call(counter, fn(reply) { Total(reply) }, 1000)
+//// }
+//// ```
+////
+//// The message type is a class family, and requests that want an answer carry
+//// a `Subject` for it. Both are checked by the compiler: a counter cannot be
+//// sent a string, and `Total` can only be answered with an `Int`.
+////
+//// Underneath is a real `gen_server`, so the usual tools, such as `observer`
+//// and `sys:get_state/1`, work as they do for Erlang servers.
+
+// SPDX-License-Identifier: Apache-2.0
+
+module server
+
+import pooka/otp.{CallError, Name, Subject}
+
+/// A running server that accepts messages of type `msg`.
+class Server(msg) {}
+
+class _Server(inbox: Subject(msg)) is Server(msg)
+
+/// What the server does before returning to ordinary mailbox processing.
+enum Action {
+  Wait,
+  Continue,
+  Hibernate
+}
+
+/// What happens after a message: carry on with a new state, or stop.
+class Next(state) {
+  let state: Option(state)
+  let normal: Bool
+  let reason: String
+  let action: Action
+  let timeout: Option(Int)
+
+  new(
+    state: Option(state),
+    normal: Bool,
+    reason: String,
+    action: Action,
+    timeout: Option(Int)
+  ) {
+    self.state = state
+    self.normal = normal
+    self.reason = reason
+    self.action = action
+    self.timeout = timeout
+  }
+}
+
+/// Carry on, with this state.
+next(state: s) -> Next(s) {
+  Next(Some(state), True, "", Action.Wait, None)
+}
+
+/// Stop, because the work is done. A supervisor does not restart a
+/// `Transient` child that stops this way.
+stop() -> Next(s) {
+  Next(None, True, "normal", Action.Wait, None)
+}
+
+/// Stop, because something went wrong. The reason is logged, and a supervisor
+/// restarts the server.
+fail(reason: String) -> Next(s) {
+  Next(None, False, reason, Action.Wait, None)
+}
+
+/// Everything needed to start a server. Make one with `spec`, then adjust it.
+class Spec(state, msg) {
+  let init: fn(Subject(msg)) -> Result(state, String)
+  let handle: fn(state, msg) -> Next(state)
+  let tidy: Option(fn(state, String) -> Nil)
+  let name: Option(Name(msg))
+  let init_timeout: Int
+  let continuation: Option(fn(state) -> Next(state))
+  let timeout_handler: Option(fn(state) -> Next(state))
+  let initial_continue: Bool
+
+  new(
+    init: fn(Subject(msg)) -> Result(state, String),
+    handle: fn(state, msg) -> Next(state),
+    on_stop: Option(fn(state, String) -> Nil),
+    name: Option(Name(msg)),
+    init_timeout: Int,
+    continuation: Option(fn(state) -> Next(state)),
+    timeout_handler: Option(fn(state) -> Next(state)),
+    initial_continue: Bool
+  ) {
+    self.init = init
+    self.handle = handle
+    self.tidy = on_stop
+    self.name = name
+    self.init_timeout = init_timeout
+    self.continuation = continuation
+    self.timeout_handler = timeout_handler
+    self.initial_continue = initial_continue
+  }
+
+  /// Register the server under a name, so it can be found with `named`, even
+  /// after a supervisor has restarted it.
+  with_name(name: Name(msg)) -> Spec(state, msg) {
+    Spec(
+      init,
+      handle,
+      tidy,
+      Some(name),
+      init_timeout,
+      continuation,
+      timeout_handler,
+      initial_continue
+    )
+  }
+
+  /// Run this when the server stops, with its last state and the reason.
+  /// Use it to tidy up: close a file, say goodbye.
+  on_stop(goodbye: fn(state, String) -> Nil) -> Spec(state, msg) {
+    Spec(
+      init,
+      handle,
+      Some(goodbye),
+      name,
+      init_timeout,
+      continuation,
+      timeout_handler,
+      initial_continue
+    )
+  }
+
+  /// How long `init` may take, in milliseconds. The default is five seconds.
+  with_init_timeout(milliseconds: Int) -> Spec(state, msg) {
+    Spec(
+      init,
+      handle,
+      tidy,
+      name,
+      milliseconds,
+      continuation,
+      timeout_handler,
+      initial_continue
+    )
+  }
+
+  /// Configure work that runs before the next external mailbox message whenever
+  /// a handler returns continue_with. Repeated continuations must eventually yield.
+  on_continue(work: fn(state) -> Next(state)) -> Spec(state, msg) {
+    Spec(
+      init,
+      handle,
+      tidy,
+      name,
+      init_timeout,
+      Some(work),
+      timeout_handler,
+      initial_continue
+    )
+  }
+
+  /// Request one continuation immediately after successful init.
+  continue_on_start() -> Spec(state, msg) {
+    Spec(
+      init,
+      handle,
+      tidy,
+      name,
+      init_timeout,
+      continuation,
+      timeout_handler,
+      True
+    )
+  }
+
+  /// Handle an idle timeout configured by next_with_timeout. Ordinary messages
+  /// cancel that timeout, matching gen_server's inactivity semantics.
+  on_timeout(work: fn(state) -> Next(state)) -> Spec(state, msg) {
+    Spec(
+      init,
+      handle,
+      tidy,
+      name,
+      init_timeout,
+      continuation,
+      Some(work),
+      initial_continue
+    )
+  }
+}
+
+/// Describe a server by its two functions.
+spec(
+  init: fn(Subject(m)) -> Result(s, String),
+  handle: fn(s, m) -> Next(s)
+) -> Spec(s, m) {
+  Spec(init, handle, None, None, 5000, None, None, False)
+}
+
+external _Ffi from erlang "pooka_otp_server" {
+  start(
+    init: fn(Subject(m)) -> Result(s, String),
+    handle: fn(s, m) -> Result(#(s, Action, Option(Int)), #(Bool, String)),
+    on_stop: Option(fn(s, String) -> Nil),
+    name: Option(String),
+    timeout: Int,
+    continuation: Option(
+      fn(s) -> Result(#(s, Action, Option(Int)), #(Bool, String))
+    ),
+    idle: Option(fn(s) -> Result(#(s, Action, Option(Int)), #(Bool, String))),
+    initial_continue: Bool,
+    create: fn(
+      fn(m) -> Nil,
+      fn(Int) -> Option(m),
+      fn() -> m,
+      fn() -> Option(Pid),
+      fn(Int, m) -> otp.Timer,
+      fn(Pid, m) -> Nil
+    ) -> Subject(m),
+    timer: fn(fn() -> Bool, fn() -> Option(Int)) -> otp.Timer
+  ) -> Result(Pid, String)
+
+  named_subject(
+    identity: String,
+    create: fn(
+      fn(m) -> Nil,
+      fn(Int) -> Option(m),
+      fn() -> m,
+      fn() -> Option(Pid),
+      fn(Int, m) -> otp.Timer,
+      fn(Pid, m) -> Nil
+    ) -> Subject(m),
+    timer: fn(fn() -> Bool, fn() -> Option(Int)) -> otp.Timer
+  ) -> Subject(m)
+
+  pid_subject(
+    pid: Pid,
+    create: fn(
+      fn(m) -> Nil,
+      fn(Int) -> Option(m),
+      fn() -> m,
+      fn() -> Option(Pid),
+      fn(Int, m) -> otp.Timer,
+      fn(Pid, m) -> Nil
+    ) -> Subject(m),
+    timer: fn(fn() -> Bool, fn() -> Option(Int)) -> otp.Timer
+  ) -> Subject(m)
+
+  stop(pid: Pid) -> Nil
+}
+
+/// Start a server, linked to this process. Returns once `init` has finished.
+///
+/// Inside a supervision tree, use `supervisor.server` instead, so the
+/// supervisor starts it and can start it again.
+start(spec: Spec(s, m)) -> Result(Server(m), String) {
+  let handle = spec.handle
+  let name = match spec.name {
+    None -> None
+    Some(value) -> Some(otp.name_id(value))
+  }
+  let continuation = _mapped(spec.continuation)
+  let idle = _mapped(spec.timeout_handler)
+  let started = _Ffi.start(
+    spec.init,
+    fn(state: s, message: m) { _step(handle(state, message)) },
+    spec.tidy,
+    name,
+    spec.init_timeout,
+    continuation,
+    idle,
+    spec.initial_continue,
+    otp.make_subject,
+    otp.make_timer
+  )?
+  Ok(_Server(_Ffi.pid_subject(started, otp.make_subject, otp.make_timer)))
+}
+
+_step(next: Next(s)) -> Result(#(s, Action, Option(Int)), #(Bool, String)) {
+  match next.state {
+    Some(state) -> Ok(#(state, next.action, next.timeout))
+    None -> Error(#(next.normal, next.reason))
+  }
+}
+
+/// The server registered under a name. Messages go to whichever process holds
+/// the name when they are sent, so this keeps working across restarts.
+named(name: Name(m)) -> Server(m) {
+  _Server(
+    _Ffi.named_subject(otp.name_id(name), otp.make_subject, otp.make_timer)
+  )
+}
+
+/// Post a message. This never waits.
+send(server: Server(m), message: m) -> Nil {
+  otp.send(subject(server), message)
+}
+
+/// Send a request and wait for its answer. See `otp.call`.
+call(
+  server: Server(m),
+  make: fn(Subject(r)) -> m,
+  timeout: Int
+) -> Result(r, CallError) {
+  otp.call(subject(server), make, timeout)
+}
+
+/// The server as a subject, for code that only knows how to send. Messages
+/// sent to it are handled like `send`, and `otp.send_after` works too.
+subject(server: Server(m)) -> Subject(m) {
+  match server {
+    _Server(inbox) -> inbox
+  }
+}
+
+/// The process running the server now, if there is one.
+pid(server: Server(m)) -> Option(Pid) {
+  otp.owner(subject(server))
+}
+
+/// Stop the server and wait until it has stopped. It stops normally, so its
+/// `on_stop` runs.
+shutdown(server: Server(m)) -> Nil {
+  match pid(server) {
+    None -> Nil
+    Some(value) -> _Ffi.stop(value)
+  }
+}
+
+_mapped(callback: Option(fn(s) -> Next(s))) -> Option(
+  fn(s) -> Result(#(s, Action, Option(Int)), #(Bool, String))
+) {
+  match callback {
+    None -> None
+    Some(work) -> Some(fn(state) { _step(work(state)) })
+  }
+}
+
+/// Yield to the configured continuation before reading another mailbox message.
+///
+/// ```pooka
+/// // Pair with spec.on_continue(fn(state) { server.next(state + 1) }).
+/// server.continue_with(0)
+/// ```
+continue_with(state: s) -> Next(s) {
+  Next(Some(state), True, "", Action.Continue, None)
+}
+
+/// Hibernate until the next message, allowing OTP to reduce an idle process heap.
+hibernate(state: s) -> Next(s) {
+  Next(Some(state), True, "", Action.Hibernate, None)
+}
+
+/// Run the configured idle handler if no ordinary message arrives in this time.
+/// Negative durations clamp to zero. Use otp.schedule for an independent deadline.
+next_with_timeout(state: s, milliseconds: Int) -> Next(s) {
+  Next(Some(state), True, "", Action.Wait, Some(milliseconds))
+}
+
+/// An object can describe a typed OTP server without exposing its callbacks as
+/// unrelated functions. Immutable handler classes keep init and handle work in
+/// the server process; actor implementations retain ordinary actor-call semantics.
+///
+/// ```pooka
+/// class Counter(initial: Int) with server.Handler(Int, Message) {
+///   init(inbox: Subject(Message)) -> Result(Int, String) { Ok(initial) }
+///   handle(state: Int, message: Message) -> server.Next(Int) {
+///     let _ = message
+///     server.next(state)
+///   }
+/// }
+/// // server.start(server.from_handler(Counter(10)))
+/// ```
+interface Handler(state, msg) {
+  init(inbox: Subject(msg)) -> Result(state, String)
+
+  handle(state: state, message: msg) -> Next(state)
+}
+
+/// Adapt an interface value into a normal Spec, preserving all the name,
+/// continuation, timeout and cleanup configuration methods.
+///
+/// The adapter invokes the handler synchronously. An actor handler moves the
+/// method body to its actor process: do not assume it owns the server's mailbox
+/// or monitors. Prefer an immutable class for process-local initialization.
+from_handler(handler: Handler(s, m)) -> Spec(s, m) {
+  spec(
+    fn(inbox) { handler.init(inbox) },
+    fn(state, message) { handler.handle(state, message) }
+  )
+}

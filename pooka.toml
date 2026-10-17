@@ -1,0 +1,11 @@
+name = "pooka_otp"
+version = "1.0.0"
+description = "Typed OTP processes, servers, supervisors and applications for Pooka"
+licences = ["Apache-2.0"]
+repository = { type = "github", user = "pooka-lang", repo = "otp" }
+links = [{ title = "Pooka", href = "https://pooka.run" }]
+
+[dependencies]
+pooka_stdlib = ">= 0.3.0 and < 1.0.0"
+
+[dev-dependencies]

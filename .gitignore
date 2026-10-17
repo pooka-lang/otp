@@ -1,0 +1,4 @@
+/build/
+/.ci-compiler/
+/.ci-http/
+.DS_Store

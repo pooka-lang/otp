@@ -1,0 +1,62 @@
+//// An OTP application: a supervision tree with a name, that the node starts
+//// and stops as one piece.
+////
+//// ```pooka
+//// import pooka/otp
+//// import pooka/otp/application
+//// import pooka/otp/supervisor.{Strategy}
+////
+//// main() {
+////   let assert Ok(_) = application.start("bakery", "Bread, on time", fn() {
+////     supervisor.start(supervisor.spec(Strategy.OneForOne, []))
+////   })
+////   otp.sleep_forever()
+//// }
+//// ```
+////
+//// The application is described while the program runs, so there is no
+//// `.app` file to write. It is a real OTP application all the same:
+//// `application:which_applications()` lists it, and stopping it stops the
+//// whole tree in order.
+
+// SPDX-License-Identifier: Apache-2.0
+
+module application
+
+import pooka/otp/supervisor.{Supervisor}
+
+external _Ffi from erlang "pooka_otp_application" {
+  start(
+    name: String,
+    description: String,
+    top: fn() -> Result(Pid, String)
+  ) -> Result(Nil, String)
+
+  stop(name: String) -> Nil
+
+  running() -> List(String)
+}
+
+/// Start an application whose top supervisor is started by `top`. Returns
+/// once the whole tree is running.
+start(
+  name: String,
+  description: String,
+  top: fn() -> Result(Supervisor, String)
+) -> Result(Nil, String) {
+  _Ffi.start(name, description, fn() {
+    let tree = top()?
+    Ok(supervisor.pid(tree))
+  })
+}
+
+/// Stop an application, and every process in its tree.
+stop(name: String) -> Nil {
+  _Ffi.stop(name)
+}
+
+/// The names of the applications running on this node, including Erlang's
+/// own, such as `kernel`.
+running() -> List(String) {
+  _Ffi.running()
+}

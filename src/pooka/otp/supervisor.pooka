@@ -1,0 +1,304 @@
+//// Supervisors: processes whose only job is to keep other processes running.
+////
+//// A supervisor starts its children in order, watches them, and starts again
+//// any that crash, following a strategy. Children can be servers, native
+//// Pooka actors, other supervisors, or anything with a start function.
+////
+//// ```pooka
+//// import pooka/otp/supervisor.{Strategy}
+////
+//// main() {
+////   let children = [
+////     supervisor.server("clock", clock()),
+////     supervisor.server("archive", archive())
+////   ]
+////   let assert Ok(tree) = supervisor.start(
+////     supervisor.spec(Strategy.OneForOne, children)
+////   )
+//// }
+//// ```
+////
+//// Underneath is a real OTP `supervisor`, so the tree shows up in `observer`
+//// like any other.
+
+// SPDX-License-Identifier: Apache-2.0
+
+module supervisor
+
+import pooka/list
+import pooka/otp.{Key}
+import pooka/otp/server as servers
+
+/// A running supervisor.
+class Supervisor {}
+
+class _Supervisor(process: Pid) is Supervisor
+
+/// What to do when a child crashes.
+///
+/// - `OneForOne`: start that child again, and leave the others alone.
+/// - `OneForAll`: stop all the children, and start them all again.
+/// - `RestForOne`: start again the child and every child started after it.
+///   Use it when later children depend on earlier ones.
+enum Strategy {
+  OneForOne,
+  OneForAll,
+  RestForOne
+}
+
+/// When to start a child again.
+///
+/// - `Permanent`: always.
+/// - `Transient`: only after a crash, not after a normal stop.
+/// - `Temporary`: never.
+enum Restart {
+  Permanent,
+  Transient,
+  Temporary
+}
+
+/// One child of a supervisor. Make one with `worker`, `server`, `actor_child`
+/// or `nested`.
+class Child {
+  let id: String
+  let start: fn() -> Result(Pid, String)
+  let restart: Restart
+  let is_supervisor: Bool
+  let shutdown: Int
+
+  new(
+    id: String,
+    start: fn() -> Result(Pid, String),
+    restart: Restart,
+    is_supervisor: Bool,
+    shutdown: Int
+  ) {
+    self.id = id
+    self.start = start
+    self.restart = restart
+    self.is_supervisor = is_supervisor
+    self.shutdown = shutdown
+  }
+
+  /// Choose when this child is started again. The default is `Permanent`.
+  with_restart(restart: Restart) -> Child {
+    Child(id, start, restart, is_supervisor, shutdown)
+  }
+
+  /// Set a worker shutdown deadline. Zero requests an immediate kill; -1 waits
+  /// indefinitely. Other negative values are rejected by OTP at startup.
+  with_shutdown(milliseconds: Int) -> Child {
+    Child(id, start, restart, is_supervisor, milliseconds)
+  }
+}
+
+/// A child started by any function that starts a process linked to the
+/// caller, and returns it.
+worker(id: String, start: fn() -> Result(Pid, String)) -> Child {
+  Child(id, start, Restart.Permanent, False, 5000)
+}
+
+/// A server as a child. The supervisor starts it with `server.start`, so it
+/// is linked to the supervisor.
+///
+/// Give the spec a name with `with_name` if other processes need to reach the
+/// server, so they keep reaching it after a restart.
+server(id: String, spec: servers.Spec(s, m)) -> Child {
+  worker(id, fn() {
+    let started = servers.start(spec)?
+    match servers.pid(started) {
+      Some(pid) -> Ok(pid)
+      None -> Error("the server stopped as soon as it started")
+    }
+  })
+}
+
+/// A native Pooka actor as a child.
+///
+/// `start` must return an actor, made with its constructor. The supervisor
+/// links to it, and stores the newest one under `key`, so the rest of the
+/// program can find it with `otp.get` after a restart. A restarted actor
+/// starts with fresh state.
+///
+/// ```pooka
+/// import pooka/otp.{Key}
+/// import pooka/otp/supervisor
+///
+/// actor Kettle {
+///   var cups: Int = 0
+/// }
+///
+/// kettle() -> Key(Kettle) {
+///   otp.key("kettle")
+/// }
+///
+/// main() {
+///   let child = supervisor.actor_child("kettle", kettle(), fn() { Kettle() })
+/// }
+/// ```
+actor_child(id: String, key: Key(a), start: fn() -> a) -> Child {
+  worker(id, fn() {
+    let made = start()
+    let pid = _Actors.link_actor(made)?
+    otp.put(key, made)
+    Ok(pid)
+  })
+}
+
+/// Another supervisor as a child, to build a tree.
+nested(id: String, spec: Spec) -> Child {
+  Child(
+    id,
+    fn() {
+      let started = start(spec)?
+      Ok(pid(started))
+    },
+    Restart.Permanent,
+    True,
+    -1
+  )
+}
+
+/// Everything needed to start a supervisor. Make one with `spec`.
+class Spec {
+  let strategy: Strategy
+  let children: List(Child)
+  let intensity: Int
+  let period: Int
+  let name: Option(String)
+
+  new(
+    strategy: Strategy,
+    children: List(Child),
+    intensity: Int,
+    period: Int,
+    name: Option(String)
+  ) {
+    self.strategy = strategy
+    self.children = children
+    self.intensity = intensity
+    self.period = period
+    self.name = name
+  }
+
+  /// How many restarts are allowed in how many seconds. One more, and the
+  /// supervisor gives up: it stops its children and then itself, and its own
+  /// supervisor decides what to do. The default is 3 restarts in 5 seconds.
+  with_intensity(restarts: Int, seconds: Int) -> Spec {
+    Spec(strategy, children, restarts, seconds, name)
+  }
+
+  /// Register the supervisor under a name.
+  with_name(name: String) -> Spec {
+    Spec(strategy, children, intensity, period, Some(name))
+  }
+}
+
+/// Describe a supervisor by its strategy and its children, in start order.
+spec(strategy: Strategy, children: List(Child)) -> Spec {
+  Spec(strategy, children, 3, 5, None)
+}
+
+external _Ffi from erlang "pooka_otp_supervisor" {
+  start(
+    name: Option(String),
+    strategy: Strategy,
+    intensity: Int,
+    period: Int,
+    children: List(#(String, fn() -> Result(Pid, String), Restart, Bool, Int))
+  ) -> Result(Pid, String)
+
+  add(
+    supervisor: Pid,
+    child: #(String, fn() -> Result(Pid, String), Restart, Bool, Int)
+  ) -> Result(Pid, String)
+
+  children(supervisor: Pid) -> List(#(String, Option(Pid)))
+
+  stop(supervisor: Pid) -> Nil
+
+  terminate(supervisor: Pid, id: String) -> Result(Nil, String)
+
+  restart_child(supervisor: Pid, id: String) -> Result(Pid, String)
+
+  delete(supervisor: Pid, id: String) -> Result(Nil, String)
+
+  counts(supervisor: Pid) -> #(Int, Int, Int, Int)
+
+  pid(supervisor: Pid) -> Pid
+}
+
+external _Actors from erlang "pooka_otp_ffi" {
+  link_actor(handle: a) -> Result(Pid, String)
+}
+
+_parts(child: Child) -> #(
+  String,
+  fn() -> Result(Pid, String),
+  Restart,
+  Bool,
+  Int
+) {
+  #(child.id, child.start, child.restart, child.is_supervisor, child.shutdown)
+}
+
+/// Start a supervisor and all its children, linked to this process. If a child
+/// fails to start, the children already started are stopped, and the error
+/// names the child.
+start(spec: Spec) -> Result(Supervisor, String) {
+  let process = _Ffi.start(
+    spec.name,
+    spec.strategy,
+    spec.intensity,
+    spec.period,
+    list.map(spec.children, _parts)
+  )?
+  Ok(_Supervisor(process))
+}
+
+/// Start one more child, after the supervisor is running.
+add(supervisor: Supervisor, child: Child) -> Result(Pid, String) {
+  _Ffi.add(pid(supervisor), _parts(child))
+}
+
+/// Each child's id, with its process if it is running, in start order.
+children(supervisor: Supervisor) -> List(#(String, Option(Pid))) {
+  _Ffi.children(pid(supervisor))
+}
+
+/// The supervisor's own process.
+pid(supervisor: Supervisor) -> Pid {
+  match supervisor {
+    _Supervisor(process) -> process
+  }
+}
+
+/// Stop the supervisor and all its children, and wait until they have
+/// stopped.
+shutdown(supervisor: Supervisor) -> Nil {
+  _Ffi.stop(pid(supervisor))
+}
+
+/// Child specification counts and current live-process counts are distinct.
+class Counts(specs: Int, active: Int, supervisors: Int, workers: Int)
+
+/// Stop a child but retain its specification, allowing an explicit restart.
+terminate(supervisor: Supervisor, id: String) -> Result(Nil, String) {
+  _Ffi.terminate(pid(supervisor), id)
+}
+
+/// Restart a stopped child. Restarting an already-running child returns Error.
+restart_child(supervisor: Supervisor, id: String) -> Result(Pid, String) {
+  _Ffi.restart_child(pid(supervisor), id)
+}
+
+/// Delete a stopped child's specification. Running children must be stopped first.
+delete(supervisor: Supervisor, id: String) -> Result(Nil, String) {
+  _Ffi.delete(pid(supervisor), id)
+}
+
+/// Inspect how many specifications and live children the supervisor owns.
+counts(supervisor: Supervisor) -> Counts {
+  let #(specs, active, supervisors, workers) = _Ffi.counts(pid(supervisor))
+  Counts(specs, active, supervisors, workers)
+}

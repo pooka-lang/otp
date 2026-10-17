@@ -1,0 +1,411 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// Typed letters, fresh identities, and the small handles that survive a restart.
+//// A Subject carries checked send and receive capabilities. Its native mailbox
+//// representation never pretends to be a Pooka class. Names and keys are fresh:
+//// their text is a label, not a lookup token. Create one at startup and pass it
+//// to the children that share it. Repeating name("clock") makes another name.
+////
+//// ```pooka
+//// let inbox: otp.Subject(String) = otp.new_subject()
+//// otp.send(inbox, "hello")
+//// assert otp.receive(inbox, 100) == Some("hello")
+//// ```
+
+module otp
+
+/// Send and receive capabilities over one message type. Only private children
+/// construct these values. Receiving is restricted to the owning process.
+class Subject(m) {}
+
+class _Subject(
+  post: fn(m) -> Nil,
+  read: fn(Int) -> Option(m),
+  wait: fn() -> m,
+  owner: fn() -> Option(Pid),
+  later: fn(Int, m) -> Timer,
+  request: fn(Pid, m) -> Nil
+) is Subject(m)
+
+/// A cancellable scheduled delivery. A successful cancellation prevents delivery;
+/// False means it already fired or was cancelled. A delivered message is not removed.
+class Timer {}
+
+class _Timer(cancel: fn() -> Bool, remaining: fn() -> Option(Int)) is Timer
+
+/// A fresh server identity. Labels do not establish equality or a message type.
+class Name(m) {}
+
+class _Name(m) is Name(m) {
+  let token: String
+
+  new(token: String) {
+    self.token = token
+  }
+}
+
+/// A fresh typed storage capability. Equal labels never share a storage slot.
+class Key(v) {}
+
+class _Key(store: fn(v) -> Nil, read: fn() -> Option(v), erase: fn() -> Nil) is Key(
+  v
+)
+
+/// Why a request received no answer.
+class CallError {}
+
+class Timeout is CallError {}
+
+class Down(reason: String) is CallError
+
+/// Node-wide Erlang logger verbosity.
+enum LogLevel {
+  Debug,
+  Info,
+  Notice,
+  Warning,
+  Error,
+  Critical
+}
+
+external _Ffi from erlang "pooka_otp_ffi" {
+  me() -> Pid
+
+  identity(label: String) -> String
+
+  new_subject(
+    create: fn(
+      fn(m) -> Nil,
+      fn(Int) -> Option(m),
+      fn() -> m,
+      fn() -> Option(Pid),
+      fn(Int, m) -> Timer,
+      fn(Pid, m) -> Nil
+    ) -> Subject(m),
+    timer: fn(fn() -> Bool, fn() -> Option(Int)) -> Timer
+  ) -> Subject(m)
+
+  call(
+    post: fn(Pid, m) -> Nil,
+    owner: fn() -> Option(Pid),
+    make: fn(Subject(r)) -> m,
+    create: fn(
+      fn(r) -> Nil,
+      fn(Int) -> Option(r),
+      fn() -> r,
+      fn() -> Option(Pid),
+      fn(Int, r) -> Timer,
+      fn(Pid, r) -> Nil
+    ) -> Subject(r),
+    timer: fn(fn() -> Bool, fn() -> Option(Int)) -> Timer,
+    timeout: Int
+  ) -> Result(r, Option(String))
+
+  new_key(create: fn(fn(v) -> Nil, fn() -> Option(v), fn() -> Nil) -> Key(v)) -> Key(
+    v
+  )
+
+  spawn(work: fn() -> Nil) -> Pid
+
+  spawn_link(work: fn() -> Nil) -> Pid
+
+  is_alive(pid: Pid) -> Bool
+
+  kill(pid: Pid) -> Nil
+
+  sleep(milliseconds: Int) -> Nil
+
+  sleep_forever() -> Nil
+
+  actor_pid(handle: a) -> Option(Pid)
+
+  set_log_level(level: LogLevel) -> Nil
+}
+
+/// The current BEAM process.
+me() -> Pid {
+  _Ffi.me()
+}
+
+/// Start an unlinked process; completion and failure remain local to it.
+spawn(work: fn() -> Nil) -> Pid {
+  _Ffi.spawn(work)
+}
+
+/// Start a linked process. An abnormal exit propagates over the link.
+spawn_link(work: fn() -> Nil) -> Pid {
+  _Ffi.spawn_link(work)
+}
+
+/// Ask whether a local process is running now; it may stop immediately afterwards.
+is_alive(pid: Pid) -> Bool {
+  _Ffi.is_alive(pid)
+}
+
+/// Stop a process without giving it an opportunity to run cleanup.
+kill(pid: Pid) -> Nil {
+  _Ffi.kill(pid)
+}
+
+/// Sleep for a nonnegative millisecond duration; negative values clamp to zero.
+sleep(milliseconds: Int) -> Nil {
+  _Ffi.sleep(milliseconds)
+}
+
+/// Wait indefinitely, usually after starting a long-running application.
+sleep_forever() -> Nil {
+  _Ffi.sleep_forever()
+}
+
+/// Inspect the checked native actor handle. Other values return None.
+actor_pid(handle: a) -> Option(Pid) {
+  _Ffi.actor_pid(handle)
+}
+
+/// Typed capability constructor for Erlang adapters. The functions themselves
+/// preserve m; no arbitrary term is reinterpreted as a Subject.
+make_subject(
+  post: fn(m) -> Nil,
+  read: fn(Int) -> Option(m),
+  wait: fn() -> m,
+  owner: fn() -> Option(Pid),
+  later: fn(Int, m) -> Timer,
+  request: fn(Pid, m) -> Nil
+) -> Subject(m) {
+  _Subject(post, read, wait, owner, later, request)
+}
+
+/// Typed timer constructor used by adapters, normally reached through schedule.
+make_timer(cancel: fn() -> Bool, remaining: fn() -> Option(Int)) -> Timer {
+  _Timer(cancel, remaining)
+}
+
+/// Create a mailbox owned by this process, with a fresh selective-receive tag.
+new_subject() -> Subject(m) {
+  _Ffi.new_subject(make_subject, make_timer)
+}
+
+/// The live process receiving these messages, if any.
+owner(subject: Subject(m)) -> Option(Pid) {
+  match subject {
+    _Subject(_, _, _, find, _, _) -> find()
+  }
+}
+
+/// Send without waiting. Sending to a stopped process deliberately loses the message.
+send(subject: Subject(m), message: m) -> Nil {
+  match subject {
+    _Subject(post, _, _, _, _, _) -> post(message)
+  }
+}
+
+/// Schedule delivery and return its cancellation handle. Negative delays clamp to zero.
+///
+/// ```pooka
+/// let timer = otp.schedule(inbox, 1000, "wake up")
+/// assert otp.cancel(timer)
+/// ```
+schedule(subject: Subject(m), milliseconds: Int, message: m) -> Timer {
+  match subject {
+    _Subject(_, _, _, _, later, _) -> later(milliseconds, message)
+  }
+}
+
+/// Schedule a delivery when the caller does not need a cancellation handle.
+send_after(subject: Subject(m), milliseconds: Int, message: m) -> Nil {
+  let _ = schedule(subject, milliseconds, message)
+  Nil
+}
+
+/// Cancel a pending timer. Already delivered messages remain in the mailbox.
+cancel(timer: Timer) -> Bool {
+  match timer {
+    _Timer(stop, _) -> stop()
+  }
+}
+
+/// Remaining milliseconds, or None after cancellation or delivery.
+remaining(timer: Timer) -> Option(Int) {
+  match timer {
+    _Timer(_, read) -> read()
+  }
+}
+
+/// Receive from a mailbox owned by this process. Other ownership is a runtime
+/// error; casts and reply-only subjects cannot be read through this function.
+receive(subject: Subject(m), timeout: Int) -> Option(m) {
+  match subject {
+    _Subject(_, read, _, _, _, _) -> read(timeout)
+  }
+}
+
+/// Receive without a deadline, subject to the same ownership rule.
+receive_forever(subject: Subject(m)) -> m {
+  match subject {
+    _Subject(_, _, wait, _, _, _) -> wait()
+  }
+}
+
+/// Make a request with a revocable reply alias. Late responses after a timeout
+/// are dropped before reaching the mailbox. The request builder runs in the caller.
+call(subject: Subject(m), make: fn(Subject(r)) -> m, timeout: Int) -> Result(
+  r,
+  CallError
+) {
+  let result = match subject {
+    _Subject(_, _, _, owner, _, request) -> _Ffi.call(
+      request,
+      owner,
+      make,
+      make_subject,
+      make_timer,
+      timeout
+    )
+  }
+  match result {
+    Ok(answer) -> Ok(answer)
+    Error(None) -> Error(Timeout())
+    Error(Some(reason)) -> Error(Down(reason))
+  }
+}
+
+/// Describe a failed request without discarding the original typed error.
+describe(problem: CallError) -> String {
+  match problem {
+    Timeout -> "no answer in time"
+    Down(reason) -> "the process is down: " + reason
+  }
+}
+
+/// Allocate a fresh named-server identity. Keep this value across restarts.
+///
+/// ```pooka
+/// let left: otp.Name(Int) = otp.name("clock")
+/// let right: otp.Name(String) = otp.name("clock")
+/// // Equal labels, separate addresses and separate message types.
+/// ```
+name(label: String) -> Name(m) {
+  _Name(_Ffi.identity(label))
+}
+
+/// An adapter's binary registry token. name always creates a fresh identity;
+/// there is deliberately no inverse function that claims an arbitrary type.
+name_id(name: Name(m)) -> String {
+  match name {
+    _Name(token) -> token
+  }
+}
+
+/// Allocate a fresh persistent storage capability. The label never participates in lookup.
+key(label: String) -> Key(v) {
+  let _ = label
+  _Ffi.new_key(_Key)
+}
+
+/// Store under this capability, replacing its previous value.
+put(key: Key(v), value: v) -> Nil {
+  match key {
+    _Key(store, _, _) -> store(value)
+  }
+}
+
+/// Read the value belonging to this exact capability.
+get(key: Key(v)) -> Option(v) {
+  match key {
+    _Key(_, read, _) -> read()
+  }
+}
+
+/// Release persistent storage. Existing holders can still store a new value.
+erase(key: Key(v)) -> Nil {
+  match key {
+    _Key(_, _, remove) -> remove()
+  }
+}
+
+/// Change logging for the whole node, not just the calling process.
+set_log_level(level: LogLevel) -> Nil {
+  _Ffi.set_log_level(level)
+}
+
+/// A process exit, keeping both the identity and its printable reason.
+class ProcessDown(pid: Pid, reason: String)
+
+/// An owner-bound monitor. It observes exits without linking process lifetimes.
+class Monitor {}
+
+class _Monitor(read: fn(Int) -> Option(ProcessDown), cancel: fn() -> Bool) is Monitor
+
+external _Watch from erlang "pooka_otp_ffi" {
+  new_monitor(
+    pid: Pid,
+    create: fn(fn(Int) -> Option(ProcessDown), fn() -> Bool) -> Monitor,
+    down: fn(Pid, String) -> ProcessDown
+  ) -> Monitor
+
+  link(pid: Pid) -> Nil
+
+  unlink(pid: Pid) -> Nil
+}
+
+/// Watch a process without receiving its exit as a failure of this process.
+///
+/// ```pooka
+/// let watch = otp.monitor(worker)
+/// otp.kill(worker)
+/// let assert Some(stopped) = otp.wait_down(watch, 1000)
+/// assert stopped.pid == worker
+/// ```
+monitor(pid: Pid) -> Monitor {
+  _Watch.new_monitor(pid, _Monitor, ProcessDown)
+}
+
+/// Wait for this monitor's DOWN notification; other mailbox messages stay put.
+wait_down(watch: Monitor, timeout: Int) -> Option(ProcessDown) {
+  match watch {
+    _Monitor(read, _) -> read(timeout)
+  }
+}
+
+/// Remove a monitor and flush its own pending notification, not unrelated ones.
+demonitor(watch: Monitor) -> Bool {
+  match watch {
+    _Monitor(_, cancel) -> cancel()
+  }
+}
+
+/// Link local process lifetimes. Abnormal exits propagate unless trapped.
+link(pid: Pid) -> Nil {
+  _Watch.link(pid)
+}
+
+/// Remove a link without stopping either process.
+unlink(pid: Pid) -> Nil {
+  _Watch.unlink(pid)
+}
+
+external _Mailbox from erlang "pooka_otp_ffi" {
+  mailbox_size() -> Int
+
+  trap_exits(enabled: Bool) -> Bool
+
+  receive_exit(timeout: Int, down: fn(Pid, String) -> ProcessDown) -> Option(
+    ProcessDown
+  )
+}
+
+/// Count this process's queued messages. Useful for observing backpressure.
+mailbox_size() -> Int {
+  _Mailbox.mailbox_size()
+}
+
+/// Change exit trapping, returning its previous value. Linking is a lifecycle
+/// decision: callers that enable trapping must handle the resulting exit messages.
+trap_exits(enabled: Bool) -> Bool {
+  _Mailbox.trap_exits(enabled)
+}
+
+/// Read one trapped link exit. Monitor DOWN notifications are separate.
+receive_exit(timeout: Int) -> Option(ProcessDown) {
+  _Mailbox.receive_exit(timeout, ProcessDown)
+}
