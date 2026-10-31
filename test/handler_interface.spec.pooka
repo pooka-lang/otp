@@ -1,0 +1,53 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// Callback objects are ordinary Pooka values; the OTP process still owns state.
+module handler_interface_test
+
+import pooka/otp.{Subject}
+import pooka/otp/server
+
+class Command {}
+
+class Add(value: Int) is Command
+
+class Read(reply: Subject(Int)) is Command
+
+class Counter(initial: Int) with server.Handler(Int, Command) {
+  init(inbox: Subject(Command)) -> Result(Int, String) {
+    let _ = inbox
+    Ok(initial)
+  }
+
+  handle(state: Int, message: Command) -> server.Next(Int) {
+    match message {
+      Add(value) -> server.next(state + value)
+      Read(reply) -> {
+        otp.send(reply, state)
+        server.next(state)
+      }
+    }
+  }
+}
+
+class Refusing with server.Handler(Int, Command) {
+  init(inbox: Subject(Command)) -> Result(Int, String) {
+    let _ = inbox
+    Error("not ready")
+  }
+
+  handle(state: Int, message: Command) -> server.Next(Int) {
+    let _ = message
+    server.next(state)
+  }
+}
+
+test "a handler class adapts to a normal configurable server spec" {
+  let assert Ok(counter) = server.start(server.from_handler(Counter(10)))
+  server.send(counter, Add(2))
+  assert server.call(counter, fn(reply) { Read(reply) }, 1000) == Ok(12)
+  server.shutdown(counter)
+}
+
+test "handler initialization errors preserve the ordinary startup result" {
+  assert server.start(server.from_handler(Refusing())) == Error("not ready")
+}

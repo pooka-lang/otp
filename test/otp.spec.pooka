@@ -1,0 +1,386 @@
+// SPDX-License-Identifier: Apache-2.0
+
+module otp_test
+
+import pooka/list
+import pooka/otp.{Key, Name, Subject}
+import pooka/otp/application
+import pooka/otp/server.{Next}
+import pooka/otp/supervisor.{Restart, Strategy}
+
+// --- a counter server, used throughout ---------------------------------------
+
+class Counter {}
+
+class Add(amount: Int) is Counter
+
+class Total(reply: Subject(Int)) is Counter
+
+class Crash is Counter {}
+
+class Finish is Counter {}
+
+_count(total: Int, message: Counter) -> Next(Int) {
+  match message {
+    Add(amount) -> server.next(total + amount)
+    Total(reply) -> {
+      otp.send(reply, total)
+      server.next(total)
+    }
+    Crash -> server.fail("asked to crash")
+    Finish -> server.stop()
+  }
+}
+
+_counter() -> server.Spec(Int, Counter) {
+  server.spec(fn(_) { Ok(0) }, _count)
+}
+
+_total(counter: server.Server(Counter)) -> Result(Int, otp.CallError) {
+  server.call(counter, fn(reply) { Total(reply) }, 1000)
+}
+
+// --- processes and subjects ----------------------------------------------------
+
+test "a subject delivers to its owner" {
+  let inbox: Subject(String) = otp.new_subject()
+  otp.send(inbox, "first")
+  otp.send(inbox, "second")
+  assert otp.receive(inbox, 100) == Some("first")
+  assert otp.receive(inbox, 100) == Some("second")
+  assert otp.receive(inbox, 10) == None
+}
+
+test "two subjects in one process keep their messages apart" {
+  let words: Subject(String) = otp.new_subject()
+  let numbers: Subject(Int) = otp.new_subject()
+  otp.send(numbers, 1)
+  otp.send(words, "one")
+  assert otp.receive(words, 100) == Some("one")
+  assert otp.receive(numbers, 100) == Some(1)
+}
+
+test "messages can be sent later" {
+  let alarm: Subject(String) = otp.new_subject()
+  otp.send_after(alarm, 30, "wake up")
+  assert otp.receive(alarm, 5) == None
+  assert otp.receive(alarm, 1000) == Some("wake up")
+}
+
+test "spawned processes can answer" {
+  let results: Subject(Int) = otp.new_subject()
+  loop n in [1, 2, 3] {
+    otp.spawn(fn() { otp.send(results, n * 10) })
+  }
+  let got = list.sort(
+    [
+      otp.receive_forever(results),
+      otp.receive_forever(results),
+      otp.receive_forever(results)
+    ]
+  )
+  assert got == [10, 20, 30]
+}
+
+class Question(text: String, reply: Subject(Int))
+
+test "a call waits for its answer" {
+  let found: Subject(Subject(Question)) = otp.new_subject()
+  otp.spawn(fn() {
+    let desk: Subject(Question) = otp.new_subject()
+    otp.send(found, desk)
+    let assert Some(question) = otp.receive(desk, 1000)
+    otp.send(question.reply, 42)
+  })
+  let assert Some(desk) = otp.receive(found, 1000)
+  assert otp.call(desk, fn(reply) { Question("why", reply) }, 1000) == Ok(42)
+}
+
+test "a call to a silent process times out" {
+  let quiet: Subject(Question) = otp.new_subject()
+  assert otp.call(quiet, fn(reply) { Question("hello?", reply) }, 20) == Error(
+    otp.Timeout()
+  )
+}
+
+test "a call to a process that dies says so" {
+  let found: Subject(Subject(Question)) = otp.new_subject()
+  let pid = otp.spawn(fn() {
+    let desk: Subject(Question) = otp.new_subject()
+    otp.send(found, desk)
+    otp.sleep(30)
+  })
+  let assert Some(desk) = otp.receive(found, 1000)
+  assert otp.call(desk, fn(reply) { Question("still there?", reply) }, 1000) == Error(
+    otp.Down("normal")
+  )
+  assert !otp.is_alive(pid)
+}
+
+test "keys keep a value" {
+  let key: Key(List(Int)) = otp.key("otp_test_numbers")
+  assert otp.get(key) == None
+  otp.put(key, [1, 2])
+  assert otp.get(key) == Some([1, 2])
+}
+
+// --- servers -------------------------------------------------------------------
+
+test "a server keeps its state between messages" {
+  let assert Ok(counter) = server.start(_counter())
+  server.send(counter, Add(2))
+  server.send(counter, Add(3))
+  assert _total(counter) == Ok(5)
+  server.shutdown(counter)
+}
+
+test "a server can be reached by name" {
+  let name: Name(Counter) = otp.name("otp_test_counter")
+  let assert Ok(_) = server.start(_counter().with_name(name))
+  server.send(server.named(name), Add(7))
+  assert _total(server.named(name)) == Ok(7)
+  assert server.start(_counter().with_name(name)) == Error(
+    "a process with that name is already running"
+  )
+  server.shutdown(server.named(name))
+  assert server.pid(server.named(name)) == None
+}
+
+test "a server can send itself messages" {
+  let ticks = server.spec(
+    fn(me: Subject(Counter)) {
+      otp.send_after(me, 10, Add(1))
+      Ok(0)
+    },
+    fn(total: Int, message: Counter) {
+      match message {
+        Add(_) -> server.next(total + 1)
+        _ -> _count(total, message)
+      }
+    }
+  )
+  let assert Ok(counter) = server.start(ticks)
+  otp.sleep(50)
+  assert _total(counter) == Ok(1)
+  server.shutdown(counter)
+}
+
+test "init can refuse to start" {
+  let refusing = server.spec(fn(_) { Error("no oven") }, _count)
+  assert server.start(refusing) == Error("no oven")
+}
+
+test "a stopped server is down" {
+  let assert Ok(counter) = server.start(_counter())
+  server.send(counter, Finish())
+  otp.sleep(20)
+  assert _total(counter) == Error(otp.Down("noproc"))
+}
+
+test "on_stop sees the last state and the reason" {
+  let report: Subject(#(Int, String)) = otp.new_subject()
+  let spec = _counter().on_stop(fn(total, reason) {
+    otp.send(report, #(total, reason))
+  })
+  let assert Ok(counter) = server.start(spec)
+  server.send(counter, Add(4))
+  server.shutdown(counter)
+  assert otp.receive(report, 1000) == Some(#(4, "normal"))
+}
+
+// --- supervisors ---------------------------------------------------------------
+
+_quiet() -> Nil {
+  otp.set_log_level(otp.LogLevel.Critical)
+}
+
+test "a supervisor restarts a crashed server" {
+  _quiet()
+  let name: Name(Counter) = otp.name("otp_test_supervised")
+  let child = supervisor.server("counter", _counter().with_name(name))
+  let assert Ok(tree) = supervisor.start(
+    supervisor.spec(Strategy.OneForOne, [child])
+  )
+  let counter = server.named(name)
+  server.send(counter, Add(10))
+  let assert Some(before) = server.pid(counter)
+  server.send(counter, Crash())
+  otp.sleep(50)
+  let assert Some(after) = server.pid(counter)
+  assert before != after
+  // a restarted server starts again from init
+  assert _total(counter) == Ok(0)
+  supervisor.shutdown(tree)
+}
+
+test "children are listed in start order" {
+  let tree_spec = supervisor.spec(
+    Strategy.OneForOne,
+    [
+      supervisor.server("first", _counter()),
+      supervisor.server("second", _counter())
+    ]
+  )
+  let assert Ok(tree) = supervisor.start(tree_spec)
+  let ids = list.map(
+    supervisor.children(tree),
+    fn(child: #(String, Option(Pid))) {
+      let #(id, _) = child
+      id
+    }
+  )
+  assert ids == ["first", "second"]
+  supervisor.shutdown(tree)
+}
+
+test "a transient child that stops normally is not restarted" {
+  let name: Name(Counter) = otp.name("otp_test_transient")
+  let once = supervisor.server("once", _counter().with_name(name))
+  let again = supervisor.server("again", _counter())
+  let tree_spec = supervisor.spec(
+    Strategy.OneForOne,
+    [once.with_restart(Restart.Transient), again]
+  )
+  let assert Ok(tree) = supervisor.start(tree_spec)
+  server.send(server.named(name), Finish())
+  otp.sleep(50)
+  let assert [#("once", None), #("again", Some(_))] = supervisor.children(tree)
+  supervisor.shutdown(tree)
+}
+
+test "a transient child that crashes is restarted" {
+  _quiet()
+  let name: Name(Counter) = otp.name("otp_test_transient_crash")
+  let child = supervisor.server("once", _counter().with_name(name)).with_restart(
+    Restart.Transient
+  )
+  let assert Ok(tree) = supervisor.start(
+    supervisor.spec(Strategy.OneForOne, [child])
+  )
+  server.send(server.named(name), Crash())
+  otp.sleep(50)
+  let assert [#("once", Some(_))] = supervisor.children(tree)
+  supervisor.shutdown(tree)
+}
+
+test "an init that crashes does not take the caller down" {
+  let crashing = server.spec(fn(_) { panic as "the oven caught fire" }, _count)
+  let assert Error(reason) = server.start(crashing)
+  assert reason != ""
+}
+
+test "a child that cannot start is named" {
+  let refusing = server.spec(fn(_) { Error("no oven") }, _count)
+  let result = supervisor.start(
+    supervisor.spec(
+      Strategy.OneForOne,
+      [supervisor.server("oven", refusing)]
+    )
+  )
+  assert result == Error("the child oven did not start: no oven")
+}
+
+actor Tally {
+  var count: Int = 0
+
+  be bump() {
+    count += 1
+  }
+
+  value() -> Int {
+    count
+  }
+
+  explode() -> Int {
+    panic as "the tally exploded"
+  }
+}
+
+_tally() -> Key(Tally) {
+  otp.key("otp_test_tally")
+}
+
+test "a supervisor restarts a native actor" {
+  _quiet()
+  let key = _tally()
+  let child = supervisor.actor_child("tally", key, fn() { Tally() })
+  let assert Ok(tree) = supervisor.start(
+    supervisor.spec(Strategy.OneForOne, [child])
+  )
+  let assert Some(first) = otp.get(key)
+  first.bump()
+  first.bump()
+  assert first.value() == 2
+  let assert Some(pid) = otp.actor_pid(first)
+  otp.kill(pid)
+  otp.sleep(50)
+  let assert Some(second) = otp.get(key)
+  assert otp.actor_pid(second) != otp.actor_pid(first)
+  assert second.value() == 0
+  supervisor.shutdown(tree)
+}
+
+test "nested supervisors" {
+  let inner = supervisor.spec(
+    Strategy.OneForAll,
+    [supervisor.server("leaf", _counter())]
+  )
+  let outer = supervisor.spec(
+    Strategy.OneForOne,
+    [supervisor.nested("branch", inner)]
+  )
+  let assert Ok(tree) = supervisor.start(outer)
+  let assert [#("branch", Some(_))] = supervisor.children(tree)
+  supervisor.shutdown(tree)
+}
+
+test "children can be added later" {
+  let assert Ok(tree) = supervisor.start(
+    supervisor.spec(Strategy.OneForOne, [])
+  )
+  let assert Ok(_) = supervisor.add(tree, supervisor.server("late", _counter()))
+  assert supervisor.add(tree, supervisor.server("late", _counter())) == Error(
+    "a child with that id is already running"
+  )
+  assert list.length(supervisor.children(tree)) == 1
+  supervisor.shutdown(tree)
+}
+
+// --- applications ---------------------------------------------------------------
+
+test "an application starts and stops its tree" {
+  let name: Name(Counter) = otp.name("otp_test_app_counter")
+  let started = application.start("otp_test_app", "A test application", fn() {
+    supervisor.start(
+      supervisor.spec(
+        Strategy.OneForOne,
+        [supervisor.server("counter", _counter().with_name(name))]
+      )
+    )
+  })
+  assert started == Ok(Nil)
+  assert list.contains(application.running(), "otp_test_app")
+  server.send(server.named(name), Add(1))
+  assert _total(server.named(name)) == Ok(1)
+  application.stop("otp_test_app")
+  assert !list.contains(application.running(), "otp_test_app")
+  assert server.pid(server.named(name)) == None
+}
+
+test "an application name that belongs to someone else is refused" {
+  let empty = fn() { supervisor.start(supervisor.spec(Strategy.OneForOne, [])) }
+  assert application.start("kernel", "Not ours", empty) == Error(
+    "the name kernel belongs to another application, such as a package; choose another"
+  )
+}
+
+test "an application can be started again after it stops" {
+  let empty = fn() { supervisor.start(supervisor.spec(Strategy.OneForOne, [])) }
+  assert application.start("otp_test_again", "Twice", empty) == Ok(Nil)
+  assert application.start("otp_test_again", "Twice", empty) == Error(
+    "the application is already running"
+  )
+  application.stop("otp_test_again")
+  assert application.start("otp_test_again", "Twice", empty) == Ok(Nil)
+  application.stop("otp_test_again")
+}

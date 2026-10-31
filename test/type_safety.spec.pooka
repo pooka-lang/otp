@@ -1,0 +1,93 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// Programs that fail to type-check are part of the public contract too.
+//// Fixtures live under build, never beside application source or test discovery.
+
+module type_safety_test
+
+import pooka/env
+import pooka/file
+import pooka/process
+import pooka/string
+
+_reject(name: String, body: String, diagnostic: String) -> Nil {
+  let assert Ok(root) = env.current_directory()
+  let directory = root + "/build/type_safety/" + name
+  let assert Ok(_) = file.create_directories(directory + "/src")
+  let assert Ok(_) = file.write(
+    directory + "/pooka.toml",
+    "name = \"type_probe\"\nversion = \"1.0.0\"\n[dependencies]\npooka_otp = { path = \"../../..\" }\n"
+  )
+  let assert Ok(_) = file.write(
+    directory + "/src/main.pooka",
+    "module main\nimport pooka/otp\nimport pooka/otp/server\n" + body
+  )
+  let assert Ok(output) = process.run_in(
+    "pooka",
+    ["check", "--json"],
+    directory
+  )
+  assert output.status != 0
+  assert string.contains(output.stderr + output.stdout, diagnostic)
+}
+
+test "subjects cannot be constructed without checked capabilities" {
+  _reject(
+    "subject",
+    "main() { let inbox: otp.Subject(Int) = otp.Subject()\nNil }",
+    "class cannot be constructed directly"
+  )
+}
+
+test "server handles cannot be fabricated" {
+  _reject(
+    "server",
+    "main() { let handle: server.Server(Int) = server.Server()\nNil }",
+    "class cannot be constructed directly"
+  )
+}
+
+test "typed keys cannot store values from another type" {
+  _reject(
+    "key",
+    "main() { let key: otp.Key(Int) = otp.key(\"count\")\notp.put(key, \"wrong\") }",
+    "type mismatch"
+  )
+}
+
+test "a subject cannot receive another protocol type" {
+  _reject(
+    "message",
+    "main() { let inbox: otp.Subject(Int) = otp.new_subject()\notp.send(inbox, \"wrong\") }",
+    "type mismatch"
+  )
+}
+
+test "an inferred mailbox cannot be generalised into incompatible protocols" {
+  _reject(
+    "inferred_subject",
+    "main() { let inbox = otp.new_subject()\notp.send(inbox, 7)\nlet answer: Option(String) = otp.receive(inbox, 0)\nanswer }",
+    "type mismatch"
+  )
+}
+
+test "an inferred key cannot be generalised into incompatible storage types" {
+  _reject(
+    "inferred_key",
+    "main() { let key = otp.key(\"shared\")\notp.put(key, 7)\nlet answer: Option(String) = otp.get(key)\nanswer }",
+    "type mismatch"
+  )
+}
+
+test "names and keys cannot be constructed from an arbitrary runtime string" {
+  _reject(
+    "name_constructor",
+    "main() { let name: otp.Name(Int) = otp.Name()\nname }",
+    "class cannot be constructed directly"
+  )
+  _reject(
+    "key_constructor",
+    "main() { let key: otp.Key(Int) = otp.Key()\nkey }",
+    "class cannot be constructed directly"
+  )
+}

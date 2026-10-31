@@ -1,0 +1,110 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// Continuations stay in the server; idle timeouts are not independent timers.
+
+module actions_test
+
+import pooka/otp.{Subject}
+import pooka/otp/server
+
+class Command {}
+
+class Read(reply: Subject(Int)) is Command
+
+class Add is Command {}
+
+_handle(state: Int, message: Command) -> server.Next(Int) {
+  match message {
+    Read(reply) -> {
+      otp.send(reply, state)
+      server.next(state)
+    }
+    Add -> server.continue_with(state + 1)
+  }
+}
+
+_total(value: server.Server(Command)) -> Result(Int, otp.CallError) {
+  server.call(value, fn(reply) { Read(reply) }, 1000)
+}
+
+test "initial continuations finish before the first request is processed" {
+  let spec = server.spec(fn(_) { Ok(0) }, _handle).on_continue(fn(state) {
+    match state < 3 {
+      True -> server.continue_with(state + 1)
+      False -> server.next(state)
+    }
+  }).continue_on_start()
+  let assert Ok(value) = server.start(spec)
+  assert _total(value) == Ok(3)
+  server.shutdown(value)
+}
+
+test "a message can request a continuation that changes the state" {
+  let assert Ok(value) = server.start(
+    server.spec(fn(_) { Ok(0) }, _handle).on_continue(
+      fn(state) { server.next(state + 10) }
+    )
+  )
+  server.send(value, Add())
+  assert _total(value) == Ok(11)
+  server.shutdown(value)
+}
+
+test "idle callbacks run after inactivity" {
+  let fired: Subject(Int) = otp.new_subject()
+  let spec = server.spec(fn(_) { Ok(0) }, fn(state: Int, message: Command) {
+    match message {
+      Add -> server.next_with_timeout(state + 1, 10)
+      Read(reply) -> {
+        otp.send(reply, state)
+        server.next(state)
+      }
+    }
+  }).on_timeout(fn(state) {
+    otp.send(fired, state)
+    server.next(state + 10)
+  })
+  let assert Ok(value) = server.start(spec)
+  server.send(value, Add())
+  assert otp.receive(fired, 1000) == Some(1)
+  assert _total(value) == Ok(11)
+  server.shutdown(value)
+}
+
+test "ordinary messages cancel a configured idle timeout" {
+  let fired: Subject(Nil) = otp.new_subject()
+  let spec = server.spec(fn(_) { Ok(0) }, fn(state: Int, message: Command) {
+    match message {
+      Add -> server.next_with_timeout(state + 1, 100)
+      Read(reply) -> {
+        otp.send(reply, state)
+        server.next(state)
+      }
+    }
+  }).on_timeout(fn(state) {
+    otp.send(fired, Nil)
+    server.next(state)
+  })
+  let assert Ok(value) = server.start(spec)
+  server.send(value, Add())
+  assert _total(value) == Ok(1)
+  assert otp.receive(fired, 200) == None
+  server.shutdown(value)
+}
+
+test "hibernating servers wake for the next typed message" {
+  let assert Ok(value) = server.start(
+    server.spec(fn(_) { Ok(0) }, fn(state: Int, message: Command) {
+      match message {
+        Add -> server.hibernate(state + 1)
+        Read(reply) -> {
+          otp.send(reply, state)
+          server.next(state)
+        }
+      }
+    })
+  )
+  server.send(value, Add())
+  assert _total(value) == Ok(1)
+  server.shutdown(value)
+}

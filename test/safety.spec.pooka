@@ -1,0 +1,206 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// A type label is useful only while its runtime identity keeps the promise.
+
+module safety_test
+
+import pooka/otp.{Subject, Key, Name}
+import pooka/otp/server
+import pooka/otp/supervisor
+
+class Message {}
+
+class Add(value: Int) is Message
+
+class Read(reply: Subject(Int)) is Message
+
+handle(state: Int, message: Message) -> server.Next(Int) {
+  match message {
+    Add(n) -> server.next(state + n)
+    Read(reply) -> {
+      otp.send(reply, state)
+      server.next(state)
+    }
+  }
+}
+
+counter() -> server.Spec(Int, Message) {
+  server.spec(fn(_) { Ok(0) }, handle)
+}
+
+test "equal key labels cannot retype a persistent slot" {
+  let numbers: Key(Int) = otp.key("same")
+  let words: Key(String) = otp.key("same")
+  otp.put(numbers, 123)
+  assert otp.get(words) == None
+  otp.put(words, "owl")
+  assert otp.get(numbers) == Some(123)
+  assert otp.get(words) == Some("owl")
+  otp.erase(numbers)
+  otp.erase(words)
+  assert otp.get(numbers) == None
+}
+
+test "equal name labels keep separate message protocols" {
+  let first: Name(Message) = otp.name("same")
+  let second: Name(String) = otp.name("same")
+  let assert Ok(_) = server.start(counter().with_name(first))
+  let assert Ok(_) = server.start(
+    server.spec(
+      fn(_) { Ok("") },
+      fn(_, message: String) { server.next(message) }
+    ).with_name(second)
+  )
+  server.send(server.named(first), Add(7))
+  server.send(server.named(second), "independent")
+  assert server.call(server.named(first), fn(reply) { Read(reply) }, 1000) == Ok(
+    7
+  )
+  assert server.pid(server.named(first)) != server.pid(server.named(second))
+  server.shutdown(server.named(first))
+  server.shutdown(server.named(second))
+}
+
+test "supervised shutdown runs cleanup with the last state" {
+  let notices: Subject(#(Int, String)) = otp.new_subject()
+  let name: Name(Message) = otp.name("cleanup")
+  let child = counter().with_name(name).on_stop(fn(state, reason) {
+    otp.send(notices, #(state, reason))
+  })
+  let assert Ok(tree) = supervisor.start(
+    supervisor.spec(
+      supervisor.Strategy.OneForOne,
+      [supervisor.server("worker", child)]
+    )
+  )
+  server.send(server.named(name), Add(7))
+  assert server.call(server.named(name), fn(reply) { Read(reply) }, 1000) == Ok(
+    7
+  )
+  supervisor.shutdown(tree)
+  assert otp.receive(notices, 1000) == Some(#(7, "shutdown"))
+}
+
+test "failed startup preserves the caller flags and unrelated exit messages" {
+  let before = otp.trap_exits(True)
+  let other = otp.spawn_link(fn() { Nil })
+  otp.sleep(20)
+  let assert Error(_) = server.start(
+    server.spec(fn(_) { Error("refused") }, handle)
+  )
+  let assert Some(exited) = otp.receive_exit(1000)
+  assert exited.pid == other
+  assert exited.reason == "normal"
+  assert otp.trap_exits(before)
+}
+
+test "failed init does not permanently enable exit trapping" {
+  let before = otp.trap_exits(False)
+  let assert Error(_) = server.start(
+    server.spec(fn(_) { panic as "init failed" }, handle)
+  )
+  assert !otp.trap_exits(before)
+}
+
+test "timed out calls drop late replies before the mailbox" {
+  let found: Subject(Subject(Subject(Int))) = otp.new_subject()
+  let gate: Subject(Nil) = otp.new_subject()
+  let worker = otp.spawn(fn() {
+    let inbox: Subject(Subject(Int)) = otp.new_subject()
+    otp.send(found, inbox)
+    let reply = otp.receive_forever(inbox)
+    otp.send_after(reply, 30, 42)
+    otp.sleep(100)
+    otp.send(gate, Nil)
+  })
+  let inbox = otp.receive_forever(found)
+  let before = otp.mailbox_size()
+  assert otp.call(inbox, fn(reply) { reply }, 1) == Error(otp.Timeout())
+  let assert Some(_) = otp.receive(gate, 1000)
+  assert otp.mailbox_size() == before
+  let watch = otp.monitor(worker)
+  let assert Some(_) = otp.wait_down(watch, 1000)
+}
+
+test "timers can be cancelled and cannot claim a delivered message" {
+  let inbox: Subject(Int) = otp.new_subject()
+  let timer = otp.schedule(inbox, 5000, 7)
+  let assert Some(left) = otp.remaining(timer)
+  assert left > 0
+  assert otp.cancel(timer)
+  assert !otp.cancel(timer)
+  assert otp.remaining(timer) == None
+  assert otp.receive(inbox, 10) == None
+  let delivered = otp.schedule(inbox, 0, 8)
+  assert otp.receive(inbox, 1000) == Some(8)
+  otp.sleep(10)
+  assert !otp.cancel(delivered)
+}
+
+test "monitors distinguish normal exits without linking the caller" {
+  let pid = otp.spawn(fn() { otp.sleep(20) })
+  let watch = otp.monitor(pid)
+  let assert Some(down) = otp.wait_down(watch, 1000)
+  assert down.pid == pid
+  assert down.reason == "normal"
+  assert otp.wait_down(watch, 0) == None
+}
+
+test "monitoring a dead process and cancelling another watch is selective" {
+  let pid = otp.spawn(fn() { Nil })
+  otp.sleep(10)
+  let first = otp.monitor(pid)
+  let second = otp.monitor(pid)
+  assert otp.demonitor(first)
+  let assert Some(down) = otp.wait_down(second, 1000)
+  assert down.pid == pid
+  assert otp.wait_down(first, 0) == None
+}
+
+test "supervisor management keeps stopped specifications until deletion" {
+  let assert Ok(tree) = supervisor.start(
+    supervisor.spec(
+      supervisor.Strategy.OneForOne,
+      [supervisor.server("counter", counter())]
+    )
+  )
+  assert supervisor.counts(tree).active == 1
+  assert supervisor.counts(tree).specs == 1
+  let assert Error(_) = supervisor.delete(tree, "counter")
+  assert supervisor.terminate(tree, "counter") == Ok(Nil)
+  assert supervisor.counts(tree).active == 0
+  assert supervisor.counts(tree).specs == 1
+  let assert Ok(_) = supervisor.restart_child(tree, "counter")
+  assert supervisor.counts(tree).active == 1
+  let assert Error(_) = supervisor.restart_child(tree, "counter")
+  assert supervisor.terminate(tree, "counter") == Ok(Nil)
+  assert supervisor.delete(tree, "counter") == Ok(Nil)
+  assert supervisor.counts(tree).specs == 0
+  let assert Error(_) = supervisor.terminate(tree, "missing")
+  supervisor.shutdown(tree)
+}
+
+test "a stopped owner's subject no longer reports a live process" {
+  let found: Subject(Subject(Int)) = otp.new_subject()
+  let pid = otp.spawn(fn() {
+    let inbox: Subject(Int) = otp.new_subject()
+    otp.send(found, inbox)
+  })
+  let inbox = otp.receive_forever(found)
+  let watch = otp.monitor(pid)
+  let assert Some(_) = otp.wait_down(watch, 1000)
+  assert otp.owner(inbox) == None
+}
+
+test "invalid startup timeouts return a typed error" {
+  let assert Error(_) = server.start(counter().with_init_timeout(-1))
+  let assert Error(_) = server.start(counter().with_init_timeout(999999999999))
+}
+
+test "supervisor shutdown is safe when another owner already stopped it" {
+  let assert Ok(tree) = supervisor.start(
+    supervisor.spec(supervisor.Strategy.OneForOne, [])
+  )
+  supervisor.shutdown(tree)
+  supervisor.shutdown(tree)
+}
