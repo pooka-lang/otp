@@ -18,9 +18,9 @@ otp.send(inbox, "hello")
 assert otp.receive(inbox, 1000) == Some("hello")
 ```
 
-Uses the real OTP behaviours. Native Pooka actors can join supervision trees, and callback objects can implement `server.Handler`. Create each typed name or key once and retain it across restarts. Requires a compiler containing the value-restriction fix in [pooka#44](https://github.com/pooka-lang/pooka/pull/44); CI builds that pinned compiler revision.
+Uses the real OTP behaviours. Native Pooka actors can join supervision trees, and callback objects can implement `server.Handler`. Create each typed name or key once and retain it across restarts.
 
-See the [API documentation](https://pooka-otp.hexdocs.pm/) for the rest. Built for [Pooka](https://pooka.run) and Erlang/OTP 29.
+See the [API documentation](https://pooka-otp.hexdocs.pm/) for the rest.
 
 ## Licence
 
