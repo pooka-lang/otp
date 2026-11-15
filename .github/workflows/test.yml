@@ -1,0 +1,39 @@
+name: test
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "29"
+          gleam-version: "1.19.0"
+          rebar3-version: "3"
+      - name: Check out the compiler
+        uses: actions/checkout@v7
+        with:
+          repository: pooka-lang/pooka
+          ref: d19e38d38dc807de26bd27152af3c7adba22a13b
+          path: .ci-compiler
+      - name: Build the compiler
+        working-directory: .ci-compiler
+        run: |
+          gleam deps download
+          gleam export escript
+          echo "$PWD" >> "$GITHUB_PATH"
+      - run: pooka deps download
+      - run: pooka test
+      - run: pooka format --check
+      - run: pooka docs
