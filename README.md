@@ -11,11 +11,15 @@ pooka add pooka_otp
 ```
 
 ```pooka
+module main
+
 import pooka/otp
 
-let inbox: otp.Subject(String) = otp.new_subject()
-otp.send(inbox, "hello")
-assert otp.receive(inbox, 1000) == Some("hello")
+main() {
+  let inbox: otp.Subject(String) = otp.new_subject()
+  otp.send(inbox, "hello")
+  assert otp.receive(inbox, 1000) == Some("hello")
+}
 ```
 
 Uses the real OTP behaviours. Native Pooka actors can join supervision trees, and callback objects can implement `server.Handler`. Create each typed name or key once and retain it across restarts.
