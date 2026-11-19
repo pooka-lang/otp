@@ -296,7 +296,10 @@ name_id(name: Name(m)) -> String {
   }
 }
 
-/// Allocate a fresh persistent storage capability. The label never participates in lookup.
+/// Allocate a fresh storage capability owned by the creating process.
+/// Holders in other processes can read and write it while its owner lives.
+/// When the owner exits, storage disappears and reads return None. A later
+/// write raises an expired-key error. The label never participates in lookup.
 key(label: String) -> Key(v) {
   let _ = label
   _Ffi.new_key(_Key)
@@ -316,7 +319,7 @@ get(key: Key(v)) -> Option(v) {
   }
 }
 
-/// Release persistent storage. Existing holders can still store a new value.
+/// Clear this slot. Holders can store again while its creating process lives.
 erase(key: Key(v)) -> Nil {
   match key {
     _Key(_, _, remove) -> remove()

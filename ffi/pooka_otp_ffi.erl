@@ -103,13 +103,33 @@ call(Post, Owner, Make, Create, Timer, Timeout) ->
     end.
 flush_reply(Ref) -> receive {Ref, _} -> flush_reply(Ref) after 0 -> ok end.
 
-%% Persistent slots use fresh references. Equal labels cannot retype a slot.
+%% Keys may cross a process boundary, but their storage has an owner. One table
+%% serves the creator's keys; ETS tidies it away when that process leaves.
+%% A fresh reference keeps equal labels from sharing a slot or changing its type.
 new_key(Create) ->
-    Ref = {?MODULE, make_ref()},
-    Create(fun(V) -> persistent_term:put(Ref, {stored, V}), nil end,
-           fun() -> case persistent_term:get(Ref, missing) of
-               missing -> none; {stored, V} -> {some, V} end end,
-           fun() -> persistent_term:erase(Ref), nil end).
+    Tag = {?MODULE, key_table},
+    Table = case erlang:get(Tag) of
+        undefined ->
+            New = ets:new(pooka_otp_keys, [set, public, {read_concurrency, true}]),
+            erlang:put(Tag, New),
+            New;
+        Existing -> Existing
+    end,
+    Ref = make_ref(),
+    Create(fun(V) ->
+               try ets:insert(Table, {Ref, V}), nil
+               catch error:badarg -> error(pooka_otp_key_expired) end
+           end,
+           fun() ->
+               try ets:lookup(Table, Ref) of
+                   [] -> none;
+                   [{Ref, V}] -> {some, V}
+               catch error:badarg -> none end
+           end,
+           fun() ->
+               try ets:delete(Table, Ref), nil
+               catch error:badarg -> nil end
+           end).
 
 spawn(Fun) -> erlang:spawn(Fun).
 spawn_link(Fun) -> erlang:spawn_link(Fun).
