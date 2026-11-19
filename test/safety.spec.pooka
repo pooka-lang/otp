@@ -28,7 +28,7 @@ counter() -> server.Spec(Int, Message) {
   server.spec(fn(_) { Ok(0) }, handle)
 }
 
-test "equal key labels cannot retype a persistent slot" {
+test "equal key labels cannot retype a storage slot" {
   let numbers: Key(Int) = otp.key("same")
   let words: Key(String) = otp.key("same")
   otp.put(numbers, 123)
@@ -203,4 +203,45 @@ test "supervisor shutdown is safe when another owner already stopped it" {
   )
   supervisor.shutdown(tree)
   supervisor.shutdown(tree)
+}
+
+test "key holders can write across processes and reuse an erased slot" {
+  let key: Key(Int) = otp.key("shared")
+  let done: Subject(Int) = otp.new_subject()
+  let _ = otp.spawn(fn() {
+    otp.put(key, 42)
+    otp.send(done, 1)
+  })
+  assert otp.receive(done, 1000) == Some(1)
+  assert otp.get(key) == Some(42)
+  otp.erase(key)
+  assert otp.get(key) == None
+  otp.put(key, 43)
+  assert otp.get(key) == Some(43)
+}
+
+test "keys lose their stored value when their creating process exits" {
+  let keys: Subject(Key(Int)) = otp.new_subject()
+  let owner = otp.spawn(fn() {
+    let key: Key(Int) = otp.key("short lived")
+    otp.put(key, 123)
+    otp.send(keys, key)
+    otp.sleep_forever()
+  })
+  let assert Some(key) = otp.receive(keys, 1000)
+  assert otp.get(key) == Some(123)
+  otp.kill(owner)
+  await_owner_exit(owner)
+  assert otp.get(key) == None
+  otp.erase(key)
+}
+
+await_owner_exit(owner: Pid) -> Nil {
+  match otp.is_alive(owner) {
+    True -> {
+      otp.sleep(1)
+      await_owner_exit(owner)
+    }
+    False -> Nil
+  }
 }
