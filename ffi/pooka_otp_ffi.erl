@@ -29,7 +29,12 @@ owner({alias, _, Pid, _}) -> live(Pid);
 owner({cast, Pid}) when is_pid(Pid) -> live(Pid);
 owner({cast, {global, Name}}) ->
     case global:whereis_name(Name) of undefined -> none; Pid -> live(Pid) end.
-live(Pid) -> case is_process_alive(Pid) of true -> {some, Pid}; false -> none end.
+%% is_process_alive/1 is local-only. A remote address is a capability, not a
+%% liveness guarantee; call/6 installs a monitor before sending and reports
+%% noproc or noconnection through the ordinary typed failure result.
+live(Pid) when node(Pid) =:= node() ->
+    case is_process_alive(Pid) of true -> {some, Pid}; false -> none end;
+live(Pid) -> {some, Pid}.
 
 post({mailbox, Pid, Ref}, M) -> Pid ! {Ref, M}, nil;
 post({alias, Alias, _, Ref}, M) -> Alias ! {Ref, M}, nil;

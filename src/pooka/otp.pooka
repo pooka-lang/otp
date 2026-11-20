@@ -185,7 +185,9 @@ new_subject() -> Subject(m) {
   _Ffi.new_subject(make_subject, make_timer)
 }
 
-/// The live process receiving these messages, if any.
+/// The process receiving these messages, if its address is available.
+/// Local addresses are checked for liveness. Remote addresses are returned
+/// without a probe; use call or a monitor to learn whether they are reachable.
 owner(subject: Subject(m)) -> Option(Pid) {
   match subject {
     _Subject(_, _, _, find, _, _) -> find()
