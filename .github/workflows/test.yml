@@ -24,6 +24,8 @@ jobs:
         with:
           pooka-version: "0.3.1"
       - run: pooka deps download
+      - name: Start loopback distribution for peer tests
+        run: ERL_EPMD_ADDRESS=127.0.0.1 epmd -daemon
       - run: pooka test
       - run: pooka format --check
       - run: pooka docs
