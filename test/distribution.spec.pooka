@@ -1,0 +1,114 @@
+//// These checks cross a real node boundary. A local PID would hide the
+//// liveness-probe mistake this regression is meant to keep out.
+module distribution_test
+
+import pooka/otp.{Subject}
+import pooka/otp/server
+
+external _Peer from erlang "pooka_otp_distribution_test" {
+  with_peer(work: fn(Pid) -> a) -> a
+
+  create(peer: Pid, factory: fn() -> a) -> a
+
+  disconnect(peer: Pid) -> Nil
+
+  reconnect(peer: Pid) -> Nil
+}
+
+class Request {}
+
+class Read(reply: Subject(Int)) is Request
+
+class Ignore(reply: Subject(Int)) is Request
+
+class Stop is Request {}
+
+receive_requests(inbox: Subject(Request)) -> Nil {
+  match otp.receive_forever(inbox) {
+    Read(reply) -> {
+      otp.send(reply, 42)
+      receive_requests(inbox)
+    }
+    Ignore(_) -> receive_requests(inbox)
+    Stop -> Nil
+  }
+}
+
+worker() -> Subject(Request) {
+  let ready: Subject(Subject(Request)) = otp.new_subject()
+  let _ = otp.spawn(fn() {
+    let inbox: Subject(Request) = otp.new_subject()
+    otp.send(ready, inbox)
+    receive_requests(inbox)
+  })
+  otp.receive_forever(ready)
+}
+
+test "remote subjects reply, time out, and remain usable afterwards" {
+  _Peer.with_peer(fn(peer) {
+    let inbox = _Peer.create(peer, worker)
+    let assert Some(pid) = otp.owner(inbox)
+    assert otp.call(inbox, fn(reply) { Read(reply) }, 2000) == Ok(42)
+    assert otp.call(inbox, fn(reply) { Ignore(reply) }, 30) == Error(
+      otp.Timeout()
+    )
+    assert otp.call(inbox, fn(reply) { Read(reply) }, 2000) == Ok(42)
+    let watch = otp.monitor(pid)
+    otp.send(inbox, Stop())
+    let assert Some(down) = otp.wait_down(watch, 2000)
+    assert down.reason == "normal"
+    assert otp.call(inbox, fn(reply) { Read(reply) }, 2000) == Error(
+      otp.Down("noproc")
+    )
+  })
+}
+
+test "remote subjects report disconnection and work after reconnection" {
+  _Peer.with_peer(fn(peer) {
+    let inbox = _Peer.create(peer, worker)
+    let assert Some(pid) = otp.owner(inbox)
+    let watch = otp.monitor(pid)
+    _Peer.disconnect(peer)
+    let assert Some(down) = otp.wait_down(watch, 2000)
+    assert down.reason == "noconnection"
+    assert otp.call(inbox, fn(reply) { Read(reply) }, 2000) == Error(
+      otp.Down("noconnection")
+    )
+    _Peer.reconnect(peer)
+    assert otp.call(inbox, fn(reply) { Read(reply) }, 2000) == Ok(42)
+  })
+}
+
+handle(state: Int, message: Request) -> server.Next(Int) {
+  match message {
+    Read(reply) -> {
+      otp.send(reply, state)
+      server.next(state)
+    }
+    Ignore(_) -> server.next(state)
+    Stop -> server.stop()
+  }
+}
+
+test "remote gen_server handles use monitored typed calls too" {
+  _Peer.with_peer(fn(peer) {
+    let remote = _Peer.create(peer, fn() {
+      let ready: Subject(Result(server.Server(Request), String)) = otp.new_subject()
+      let _ = otp.spawn(fn() {
+        let counter = server.start(server.spec(fn(_) { Ok(17) }, handle))
+        otp.send(ready, counter)
+        let hold: Subject(Nil) = otp.new_subject()
+        otp.receive_forever(hold)
+      })
+      otp.receive_forever(ready)
+    })
+    let assert Ok(counter) = remote
+    assert server.call(counter, fn(reply) { Read(reply) }, 2000) == Ok(17)
+    _Peer.disconnect(peer)
+    assert server.call(counter, fn(reply) { Read(reply) }, 2000) == Error(
+      otp.Down("noconnection")
+    )
+    _Peer.reconnect(peer)
+    assert server.call(counter, fn(reply) { Read(reply) }, 2000) == Ok(17)
+  })
+}

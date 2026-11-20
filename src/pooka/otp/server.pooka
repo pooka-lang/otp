@@ -344,7 +344,8 @@ subject(server: Server(m)) -> Subject(m) {
   }
 }
 
-/// The process running the server now, if there is one.
+/// The server's process address, if it can be resolved. For remote processes
+/// this is not a liveness guarantee; a monitored call reports disconnection.
 pid(server: Server(m)) -> Option(Pid) {
   otp.owner(subject(server))
 }
