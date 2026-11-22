@@ -9,3 +9,8 @@ links = [{ title = "Pooka", href = "https://pooka.run" }]
 pooka_stdlib = ">= 0.3.0 and < 1.0.0"
 
 [dev-dependencies]
+
+[[documentation.pages]]
+title = "Module guide"
+path = "modules.html"
+source = "docs/modules.md"

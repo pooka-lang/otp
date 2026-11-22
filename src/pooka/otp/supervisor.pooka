@@ -28,6 +28,7 @@ module supervisor
 import pooka/list
 import pooka/otp.{Key}
 import pooka/otp/server as servers
+import pooka/otp/statem as machines
 
 /// A running supervisor.
 class Supervisor {}
@@ -109,6 +110,17 @@ server(id: String, spec: servers.Spec(s, m)) -> Child {
     match servers.pid(started) {
       Some(pid) -> Ok(pid)
       None -> Error("the server stopped as soon as it started")
+    }
+  })
+}
+
+/// Start a state machine as a supervised worker.
+statem(id: String, spec: machines.Spec(s, d, m)) -> Child {
+  worker(id, fn() {
+    let started = machines.start(spec)?
+    match machines.pid(started) {
+      Some(pid) -> Ok(pid)
+      None -> Error("the state machine stopped as soon as it started")
     }
   })
 }

@@ -91,3 +91,24 @@ test "names and keys cannot be constructed from an arbitrary runtime string" {
     "class cannot be constructed directly"
   )
 }
+
+test "ETS handles cannot be fabricated or accept another value type" {
+  _reject(
+    "ets_constructor",
+    "import pooka/otp/ets\nmain() { let table: ets.Table(Int, String) = ets.Table()\ntable }",
+    "class cannot be constructed directly"
+  )
+  _reject(
+    "ets_value",
+    "import pooka/otp/ets\nmain() { let assert Ok(table) = ets.create(ets.Kind.Set, ets.Access.Private)\nlet _ = ets.insert(table, 1, \"text\")\nets.increment(table, 1, 1, 0) }",
+    "type mismatch"
+  )
+}
+
+test "state machines reject messages outside their protocol" {
+  _reject(
+    "statem_message",
+    "import pooka/otp/statem\nmain() { let name: otp.Name(Int) = otp.name(\"counter\")\nstatem.send(statem.named(name), \"wrong\") }",
+    "type mismatch"
+  )
+}

@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Add typed `gen_statem` processes with supervisor integration, postponed events, and OTP timers.
+- Add typed ETS tables with access modes, atomic updates, bounded scans, and ownership transfer.
+
 ## 1.1.0 - 2026-11-20
 
 ### Fixed
