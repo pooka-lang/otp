@@ -1,0 +1,290 @@
+//// A typed state machine backed by OTP's gen_statem. Keep the phase separate
+//// from its data so OTP knows when to retry postponed messages or cancel a
+//// state timeout.
+////
+//// ```pooka
+//// import pooka/otp/statem
+////
+//// enum Door { Closed, Open }
+//// enum Message { Turn }
+////
+//// handle(phase: Door, turns: Int, message: Message) -> statem.Step(Door, Int, Message) {
+////   match phase {
+////     Door.Closed -> statem.transition(Door.Open, turns + 1)
+////     Door.Open -> statem.transition(Door.Closed, turns + 1)
+////   }
+//// }
+//// ```
+
+// SPDX-License-Identifier: Apache-2.0
+
+module statem
+
+import pooka/otp.{CallError, Name, Subject}
+
+class Machine(m) {}
+
+class _Machine(inbox: Subject(m)) is Machine(m)
+
+/// OTP event, state and named timers have different cancellation rules.
+enum _ActionKind {
+  Postpone,
+  Hibernate,
+  Internal,
+  EventTimeout,
+  StateTimeout,
+  NamedTimeout,
+  CancelEventTimeout,
+  CancelStateTimeout,
+  CancelNamedTimeout
+}
+
+class Action(m) {}
+
+class _Action(m) is Action(m) {
+  let kind: _ActionKind
+  let message: Option(m)
+  let milliseconds: Int
+  let name: String
+
+  new(kind: _ActionKind, message: Option(m), milliseconds: Int, name: String) {
+    self.kind = kind
+    self.message = message
+    self.milliseconds = milliseconds
+    self.name = name
+  }
+}
+
+/// Retry this message after the machine changes state.
+postpone() -> Action(m) {
+  _Action(_ActionKind.Postpone, None, 0, "")
+}
+
+/// Hibernate until another event arrives.
+hibernate() -> Action(m) {
+  _Action(_ActionKind.Hibernate, None, 0, "")
+}
+
+/// Handle a message before the next external event.
+internal(message: m) -> Action(m) {
+  _Action(_ActionKind.Internal, Some(message), 0, "")
+}
+
+/// Deliver a message only if no other event arrives first.
+event_timeout(milliseconds: Int, message: m) -> Action(m) {
+  _Action(_ActionKind.EventTimeout, Some(message), milliseconds, "")
+}
+
+/// Deliver a message unless the machine changes state first.
+state_timeout(milliseconds: Int, message: m) -> Action(m) {
+  _Action(_ActionKind.StateTimeout, Some(message), milliseconds, "")
+}
+
+/// Set or replace an independent timer that survives state changes.
+named_timeout(name: String, milliseconds: Int, message: m) -> Action(m) {
+  _Action(_ActionKind.NamedTimeout, Some(message), milliseconds, name)
+}
+
+cancel_event_timeout() -> Action(m) {
+  _Action(_ActionKind.CancelEventTimeout, None, 0, "")
+}
+
+cancel_state_timeout() -> Action(m) {
+  _Action(_ActionKind.CancelStateTimeout, None, 0, "")
+}
+
+cancel_named_timeout(name: String) -> Action(m) {
+  _Action(_ActionKind.CancelNamedTimeout, None, 0, name)
+}
+
+/// The next data and optional phase, or a reason to stop.
+class Step(s, d, m) {
+  let update: Result(#(Option(s), d), #(Bool, String))
+  let actions: List(Action(m))
+
+  new(
+    update: Result(#(Option(s), d), #(Bool, String)),
+    actions: List(Action(m))
+  ) {
+    self.update = update
+    self.actions = actions
+  }
+
+  /// Run these actions in the order supplied.
+  with_actions(actions: List(Action(m))) -> Step(s, d, m) {
+    Step(update, actions)
+  }
+}
+
+stay(data: d) -> Step(s, d, m) {
+  Step(Ok(#(None, data)), [])
+}
+
+transition(state: s, data: d) -> Step(s, d, m) {
+  Step(Ok(#(Some(state), data)), [])
+}
+
+stop() -> Step(s, d, m) {
+  Step(Error(#(True, "normal")), [])
+}
+
+fail(reason: String) -> Step(s, d, m) {
+  Step(Error(#(False, reason)), [])
+}
+
+/// The initial phase and data, event handler and optional termination hook.
+class Spec(s, d, m) {
+  let init: fn(Subject(m)) -> Result(#(s, d, List(Action(m))), String)
+  let handle: fn(s, d, m) -> Step(s, d, m)
+  let tidy: Option(fn(s, d, String) -> Nil)
+  let name: Option(Name(m))
+
+  new(
+    init: fn(Subject(m)) -> Result(#(s, d, List(Action(m))), String),
+    handle: fn(s, d, m) -> Step(s, d, m),
+    tidy: Option(fn(s, d, String) -> Nil),
+    name: Option(Name(m))
+  ) {
+    self.init = init
+    self.handle = handle
+    self.tidy = tidy
+    self.name = name
+  }
+
+  on_stop(hook: fn(s, d, String) -> Nil) -> Spec(s, d, m) {
+    Spec(init, handle, Some(hook), name)
+  }
+
+  with_name(identity: Name(m)) -> Spec(s, d, m) {
+    Spec(init, handle, tidy, Some(identity))
+  }
+}
+
+spec(
+  init: fn(Subject(m)) -> Result(#(s, d, List(Action(m))), String),
+  handle: fn(s, d, m) -> Step(s, d, m)
+) -> Spec(s, d, m) {
+  Spec(init, handle, None, None)
+}
+
+/// Start linked to the caller and wait until initialization finishes.
+start(spec: Spec(s, d, m)) -> Result(Machine(m), String) {
+  let handle = spec.handle
+  let init = spec.init
+  let name = match spec.name {
+    Some(value) -> Some(otp.name_id(value))
+    None -> None
+  }
+  let process = _Ffi.start(
+    fn(inbox) {
+      let #(state, data, actions) = init(inbox)?
+      Ok(#(state, data, _actions(actions)))
+    },
+    fn(state, data, message) {
+      let step = handle(state, data, message)
+      let #(phase, next) = step.update?
+      Ok(#(phase, next, _actions(step.actions)))
+    },
+    spec.tidy,
+    name,
+    otp.make_subject,
+    otp.make_timer
+  )?
+  Ok(_Machine(_Ffi.subject_at(process, otp.make_subject, otp.make_timer)))
+}
+
+_actions(actions: List(Action(m))) -> List(
+  #(_ActionKind, Option(m), Int, String)
+) {
+  match actions {
+    [] -> []
+    [_Action(kind, message, milliseconds, name), ..rest] -> [
+      #(kind, message, milliseconds, name),
+      .._actions(rest)
+    ]
+  }
+}
+
+/// Reach a registered machine by the same name after a supervisor restarts it.
+named(name: Name(m)) -> Machine(m) {
+  _Machine(_Ffi.named(otp.name_id(name), otp.make_subject, otp.make_timer))
+}
+
+subject(machine: Machine(m)) -> Subject(m) {
+  let assert _Machine(inbox) = machine
+  inbox
+}
+
+pid(machine: Machine(m)) -> Option(Pid) {
+  otp.owner(subject(machine))
+}
+
+send(machine: Machine(m), message: m) -> Nil {
+  otp.send(subject(machine), message)
+}
+
+call(machine: Machine(m), make: fn(Subject(r)) -> m, timeout: Int) -> Result(
+  r,
+  CallError
+) {
+  otp.call(subject(machine), make, timeout)
+}
+
+shutdown(machine: Machine(m)) -> Nil {
+  match pid(machine) {
+    Some(process) -> _Ffi.stop(process)
+    None -> Nil
+  }
+}
+
+external _Ffi from erlang "pooka_otp_statem" {
+  start(
+    init: fn(Subject(m)) -> Result(
+      #(s, d, List(#(_ActionKind, Option(m), Int, String))),
+      String
+    ),
+    handle: fn(s, d, m) -> Result(
+      #(Option(s), d, List(#(_ActionKind, Option(m), Int, String))),
+      #(Bool, String)
+    ),
+    tidy: Option(fn(s, d, String) -> Nil),
+    name: Option(String),
+    create: fn(
+      fn(m) -> Nil,
+      fn(Int) -> Option(m),
+      fn() -> m,
+      fn() -> Option(Pid),
+      fn(Int, m) -> otp.Timer,
+      fn(Pid, m) -> Nil
+    ) -> Subject(m),
+    timer: fn(fn() -> Bool, fn() -> Option(Int)) -> otp.Timer
+  ) -> Result(Pid, String)
+
+  subject_at(
+    process: Pid,
+    create: fn(
+      fn(m) -> Nil,
+      fn(Int) -> Option(m),
+      fn() -> m,
+      fn() -> Option(Pid),
+      fn(Int, m) -> otp.Timer,
+      fn(Pid, m) -> Nil
+    ) -> Subject(m),
+    timer: fn(fn() -> Bool, fn() -> Option(Int)) -> otp.Timer
+  ) -> Subject(m)
+
+  named(
+    identity: String,
+    create: fn(
+      fn(m) -> Nil,
+      fn(Int) -> Option(m),
+      fn() -> m,
+      fn() -> Option(Pid),
+      fn(Int, m) -> otp.Timer,
+      fn(Pid, m) -> Nil
+    ) -> Subject(m),
+    timer: fn(fn() -> Bool, fn() -> Option(Int)) -> otp.Timer
+  ) -> Subject(m)
+
+  stop(process: Pid) -> Nil
+}

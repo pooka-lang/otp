@@ -1,0 +1,381 @@
+//// ETS tables live on one BEAM node. A table belongs to the process that
+//// creates it and disappears when that process exits, unless it has an heir.
+//// A supervised owner can share a protected table with readers while keeping
+//// writes in one place. Use a public table when multiple processes must write.
+////
+//// ```pooka
+//// import pooka/otp/ets
+////
+//// lookup_example() -> Result(List(String), String) {
+////   let table = ets.create(ets.Kind.Set, ets.Access.Protected)?
+////   let _ = ets.insert(table, 42, "the answer")?
+////   ets.lookup(table, 42)
+//// }
+//// ```
+
+// SPDX-License-Identifier: Apache-2.0
+
+module ets
+
+import pooka/list
+
+/// The number of values that an ETS key can hold and how traversal is ordered.
+enum Kind {
+  Set,
+  OrderedSet,
+  Bag,
+  DuplicateBag
+}
+
+/// Private tables are owner-only. Protected tables let any local process read.
+/// Public tables also let any local process write. Ownership operations still
+/// belong to the owner.
+enum Access {
+  Private,
+  Protected,
+  Public
+}
+
+/// Automatic mode lets the runtime tune write concurrency as load changes.
+enum WriteConcurrency {
+  Disabled,
+  Enabled,
+  Automatic
+}
+
+class Options(
+  kind: Kind,
+  access: Access,
+  read_concurrency: Bool,
+  write_concurrency: WriteConcurrency,
+  decentralized_counters: Bool,
+  compressed: Bool
+) {}
+
+/// A typed handle to an anonymous table. Share this handle with local processes.
+class Table(key, value) {}
+
+class _Id {}
+
+class _Table(k, v) is Table(k, v) {
+  let id: _Id
+
+  new(id: _Id) {
+    self.id = id
+  }
+}
+
+/// A continuation from scan. Resume it on the node that owns the table.
+class Cursor(key, value) {}
+
+class _Continuation {}
+
+class _Cursor(k, v) is Cursor(k, v) {
+  let value: _Continuation
+
+  new(value: _Continuation) {
+    self.value = value
+  }
+}
+
+/// Start with ETS defaults for concurrency and compression.
+options(kind: Kind, access: Access) -> Options {
+  Options(kind, access, False, WriteConcurrency.Disabled, False, False)
+}
+
+/// Create a table owned by the calling process.
+create(kind: Kind, access: Access) -> Result(Table(k, v), String) {
+  create_with(options(kind, access))
+}
+
+/// Create a table with custom concurrency and compression settings.
+create_with(config: Options) -> Result(Table(k, v), String) {
+  let id = _Ffi.create(
+    config.kind,
+    config.access,
+    config.read_concurrency,
+    config.write_concurrency,
+    config.decentralized_counters,
+    config.compressed
+  )?
+  Ok(_Table(id))
+}
+
+_id(table: Table(k, v)) -> _Id {
+  let assert _Table(id) = table
+  id
+}
+
+/// Read a batch of rows and a continuation for the next batch. This traverses
+/// the native table without collecting all rows. Concurrent writes can affect
+/// what the traversal sees. The batch size must be positive.
+scan(table: Table(k, v), limit: Int) -> Result(
+  #(List(#(k, v)), Option(Cursor(k, v))),
+  String
+) {
+  let id = _id(table)
+  _batch(_Ffi.scan(id, limit)?)
+}
+
+/// Resume a scan with the same batch size. A missing cursor ends the scan.
+resume(cursor: Cursor(k, v)) -> Result(
+  #(List(#(k, v)), Option(Cursor(k, v))),
+  String
+) {
+  let assert _Cursor(value) = cursor
+  _batch(_Ffi.resume(value)?)
+}
+
+_batch(batch: #(List(#(k, v)), Option(_Continuation))) -> Result(
+  #(List(#(k, v)), Option(Cursor(k, v))),
+  String
+) {
+  let #(rows, next) = batch
+  match next {
+    Some(value) -> Ok(#(rows, Some(_Cursor(value))))
+    None -> Ok(#(rows, None))
+  }
+}
+
+/// Reduce a table in batches. A fold sees the same live traversal as scan.
+fold(table: Table(k, v), limit: Int, initial: a, step: fn(a, #(k, v)) -> a) -> Result(
+  a,
+  String
+) {
+  _fold_batch(scan(table, limit)?, initial, step)
+}
+
+_fold_batch(
+  batch: #(List(#(k, v)), Option(Cursor(k, v))),
+  initial: a,
+  step: fn(a, #(k, v)) -> a
+) -> Result(a, String) {
+  let #(rows, next) = batch
+  let total = list.fold(rows, initial, step)
+  match next {
+    Some(cursor) -> _fold_batch(resume(cursor)?, total, step)
+    None -> Ok(total)
+  }
+}
+
+/// A table with an expired handle or insufficient access returns Error.
+/// Store a row. A set replaces the previous value at the same key.
+insert(table: Table(k, v), key: k, value: v) -> Result(Nil, String) {
+  let id = _id(table)
+  _Ffi.insert(id, key, value)
+}
+
+/// Store a batch of rows in one ETS operation.
+insert_many(table: Table(k, v), rows: List(#(k, v))) -> Result(Nil, String) {
+  let id = _id(table)
+  _Ffi.insert_many(id, rows)
+}
+
+/// Store a row only if its key is absent. The check and insert are atomic.
+insert_new(table: Table(k, v), key: k, value: v) -> Result(Bool, String) {
+  let id = _id(table)
+  _Ffi.insert_new(id, key, value)
+}
+
+/// Store every row only if all the keys are absent.
+insert_new_many(table: Table(k, v), rows: List(#(k, v))) -> Result(Bool, String) {
+  let id = _id(table)
+  _Ffi.insert_new_many(id, rows)
+}
+
+/// Read all values at a key. A set returns zero or one value.
+lookup(table: Table(k, v), key: k) -> Result(List(v), String) {
+  let id = _id(table)
+  _Ffi.lookup(id, key)
+}
+
+/// Check whether a key exists.
+contains(table: Table(k, v), key: k) -> Result(Bool, String) {
+  let id = _id(table)
+  _Ffi.contains(id, key)
+}
+
+/// Atomically remove a key and return all its values.
+take(table: Table(k, v), key: k) -> Result(List(v), String) {
+  let id = _id(table)
+  _Ffi.take(id, key)
+}
+
+/// Remove all rows at a key.
+delete(table: Table(k, v), key: k) -> Result(Nil, String) {
+  let id = _id(table)
+  _Ffi.delete(id, key)
+}
+
+/// Remove rows matching both the key and value.
+delete_object(table: Table(k, v), key: k, value: v) -> Result(Nil, String) {
+  let id = _id(table)
+  _Ffi.delete_object(id, key, value)
+}
+
+/// Remove all rows while keeping the table and its settings.
+clear(table: Table(k, v)) -> Result(Nil, String) {
+  let id = _id(table)
+  _Ffi.clear(id)
+}
+
+/// Delete the table. Only its owner can do this.
+drop(table: Table(k, v)) -> Result(Nil, String) {
+  let id = _id(table)
+  _Ffi.drop(id)
+}
+
+/// Read all rows. Use scan to visit large tables in batches.
+entries(table: Table(k, v)) -> Result(List(#(k, v)), String) {
+  let id = _id(table)
+  _Ffi.entries(id)
+}
+
+/// Read the first key. Only ordered sets guarantee key order.
+first(table: Table(k, v)) -> Result(Option(k), String) {
+  let id = _id(table)
+  _Ffi.first(id)
+}
+
+/// Read the last key. Only ordered sets guarantee key order.
+last(table: Table(k, v)) -> Result(Option(k), String) {
+  let id = _id(table)
+  _Ffi.last(id)
+}
+
+/// Advance to the next key. Unordered tables require the previous key to still exist.
+next(table: Table(k, v), key: k) -> Result(Option(k), String) {
+  let id = _id(table)
+  _Ffi.next(id, key)
+}
+
+/// Advance backwards. Unordered tables require the previous key to still exist.
+previous(table: Table(k, v), key: k) -> Result(Option(k), String) {
+  let id = _id(table)
+  _Ffi.previous(id, key)
+}
+
+/// Read the current number of rows.
+size(table: Table(k, v)) -> Result(Int, String) {
+  let id = _id(table)
+  _Ffi.size(id)
+}
+
+/// Read the memory used by the table in BEAM words.
+memory_words(table: Table(k, v)) -> Result(Int, String) {
+  let id = _id(table)
+  _Ffi.memory_words(id)
+}
+
+/// Find the process that currently owns the table.
+owner(table: Table(k, v)) -> Result(Pid, String) {
+  let id = _id(table)
+  _Ffi.owner(id)
+}
+
+/// Transfer ownership. The recipient should already have the typed handle.
+give_away(table: Table(k, v), recipient: Pid) -> Result(Nil, String) {
+  let id = _id(table)
+  _Ffi.give_away(id, recipient)
+}
+
+/// Choose who inherits the table on owner exit, or clear the heir with None.
+set_heir(table: Table(k, v), heir: Option(Pid)) -> Result(Nil, String) {
+  let id = _id(table)
+  _Ffi.set_heir(id, heir)
+}
+
+/// Replace a value only if its key exists. Use a set or ordered set.
+replace(table: Table(k, v), key: k, value: v) -> Result(Bool, String) {
+  _Ffi.replace(_id(table), key, value)
+}
+
+/// Replace a value only if it matches expected. The comparison and write
+/// happen in one ETS operation. Use a set or ordered set.
+compare_exchange(table: Table(k, v), key: k, expected: v, replacement: v) -> Result(
+  Bool,
+  String
+) {
+  _Ffi.compare_exchange(_id(table), key, expected, replacement)
+}
+
+/// Atomically increment an integer value, inserting starting + amount if absent. Use a set.
+increment(table: Table(k, Int), key: k, amount: Int, starting: Int) -> Result(
+  Int,
+  String
+) {
+  let id = _id(table)
+  _Ffi.increment(id, key, amount, starting)
+}
+
+external _Ffi from erlang "pooka_otp_ets" {
+  create(
+    kind: Kind,
+    access: Access,
+    read: Bool,
+    write: WriteConcurrency,
+    decentralized: Bool,
+    compressed: Bool
+  ) -> Result(_Id, String)
+
+  scan(id: _Id, limit: Int) -> Result(
+    #(List(#(k, v)), Option(_Continuation)),
+    String
+  )
+
+  resume(cursor: _Continuation) -> Result(
+    #(List(#(k, v)), Option(_Continuation)),
+    String
+  )
+
+  insert(id: _Id, key: k, value: v) -> Result(Nil, String)
+
+  insert_many(id: _Id, rows: List(#(k, v))) -> Result(Nil, String)
+
+  insert_new(id: _Id, key: k, value: v) -> Result(Bool, String)
+
+  insert_new_many(id: _Id, rows: List(#(k, v))) -> Result(Bool, String)
+
+  lookup(id: _Id, key: k) -> Result(List(v), String)
+
+  contains(id: _Id, key: k) -> Result(Bool, String)
+
+  take(id: _Id, key: k) -> Result(List(v), String)
+
+  delete(id: _Id, key: k) -> Result(Nil, String)
+
+  delete_object(id: _Id, key: k, value: v) -> Result(Nil, String)
+
+  clear(id: _Id) -> Result(Nil, String)
+
+  drop(id: _Id) -> Result(Nil, String)
+
+  entries(id: _Id) -> Result(List(#(k, v)), String)
+
+  first(id: _Id) -> Result(Option(k), String)
+
+  last(id: _Id) -> Result(Option(k), String)
+
+  next(id: _Id, key: k) -> Result(Option(k), String)
+
+  previous(id: _Id, key: k) -> Result(Option(k), String)
+
+  size(id: _Id) -> Result(Int, String)
+
+  memory_words(id: _Id) -> Result(Int, String)
+
+  owner(id: _Id) -> Result(Pid, String)
+
+  give_away(id: _Id, recipient: Pid) -> Result(Nil, String)
+
+  set_heir(id: _Id, heir: Option(Pid)) -> Result(Nil, String)
+
+  replace(id: _Id, key: k, value: v) -> Result(Bool, String)
+
+  compare_exchange(id: _Id, key: k, expected: v, replacement: v) -> Result(
+    Bool,
+    String
+  )
+
+  increment(id: _Id, key: k, amount: Int, starting: Int) -> Result(Int, String)
+}

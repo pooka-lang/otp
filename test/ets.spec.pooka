@@ -1,0 +1,90 @@
+// SPDX-License-Identifier: Apache-2.0
+
+module ets_test
+
+import pooka/otp
+import pooka/otp/ets
+
+test "sets expose atomic conditional writes and take" {
+  let assert Ok(table) = ets.create(ets.Kind.Set, ets.Access.Private)
+  assert ets.insert_new(table, "key", 1) == Ok(True)
+  assert ets.insert_new(table, "key", 2) == Ok(False)
+  assert ets.insert_new_many(table, [#("other", 3), #("key", 4)]) == Ok(False)
+  assert ets.contains(table, "other") == Ok(False)
+  assert ets.replace(table, "absent", 2) == Ok(False)
+  assert ets.replace(table, "key", 2) == Ok(True)
+  assert ets.compare_exchange(table, "key", 1, 5) == Ok(False)
+  assert ets.compare_exchange(table, "key", 2, 5) == Ok(True)
+  assert ets.increment(table, "key", 3, 0) == Ok(8)
+  assert ets.increment(table, "counter", 2, 10) == Ok(12)
+  assert ets.take(table, "key") == Ok([8])
+  assert ets.take(table, "key") == Ok([])
+  assert ets.size(table) == Ok(1)
+  assert ets.drop(table) == Ok(Nil)
+  let assert Error(_) = ets.lookup(table, "key")
+}
+
+test "bags support multiple values and exact row deletion" {
+  let assert Ok(table) = ets.create(ets.Kind.DuplicateBag, ets.Access.Private)
+  assert ets.insert_many(table, [#(1, "a"), #(1, "a"), #(1, "b")]) == Ok(Nil)
+  assert ets.size(table) == Ok(3)
+  assert ets.delete_object(table, 1, "a") == Ok(Nil)
+  assert ets.lookup(table, 1) == Ok(["b"])
+  assert ets.delete(table, 1) == Ok(Nil)
+  assert ets.entries(table) == Ok([])
+  assert ets.drop(table) == Ok(Nil)
+}
+
+test "ordered traversal and bounded native scans return typed rows" {
+  let assert Ok(table) = ets.create(ets.Kind.OrderedSet, ets.Access.Private)
+  assert ets.first(table) == Ok(None)
+  assert ets.insert_many(table, [#(3, "c"), #(1, "a"), #(2, "b")]) == Ok(Nil)
+  assert ets.first(table) == Ok(Some(1))
+  assert ets.last(table) == Ok(Some(3))
+  assert ets.next(table, 1) == Ok(Some(2))
+  assert ets.previous(table, 3) == Ok(Some(2))
+  let assert Ok(#(first, Some(cursor))) = ets.scan(table, 2)
+  assert first == [#(1, "a"), #(2, "b")]
+  let assert Ok(#(last, _)) = ets.resume(cursor)
+  assert last == [#(3, "c")]
+  let assert Ok(words) = ets.memory_words(table)
+  assert words > 0
+  assert ets.clear(table) == Ok(Nil)
+  assert ets.last(table) == Ok(None)
+  assert ets.drop(table) == Ok(Nil)
+}
+
+test "protected tables allow shared reads and owner-only writes" {
+  let assert Ok(table) = ets.create(ets.Kind.Set, ets.Access.Protected)
+  assert ets.owner(table) == Ok(otp.me())
+  assert ets.insert(table, 1, "owner") == Ok(Nil)
+  let reply = otp.new_subject()
+  let _ = otp.spawn(fn() {
+    otp.send(reply, #(ets.lookup(table, 1), ets.insert(table, 1, "other")))
+  })
+  let assert Some(#(Ok(["owner"]), Error(_))) = otp.receive(reply, 1000)
+  assert ets.lookup(table, 1) == Ok(["owner"])
+  assert ets.drop(table) == Ok(Nil)
+}
+
+test "an heir survives the table creator and can write to the table" {
+  let receiver = otp.me()
+  let handle = otp.new_subject()
+  let process = otp.spawn(fn() {
+    let quit = otp.new_subject()
+    let assert Ok(table) = ets.create(ets.Kind.Set, ets.Access.Protected)
+    assert ets.insert(table, 1, "before") == Ok(Nil)
+    assert ets.set_heir(table, Some(receiver)) == Ok(Nil)
+    otp.send(handle, #(table, quit))
+    let _ = otp.receive(quit, 1000)
+    Nil
+  })
+  let watcher = otp.monitor(process)
+  let assert Some(#(table, quit)) = otp.receive(handle, 1000)
+  otp.send(quit, Nil)
+  let assert Some(_) = otp.wait_down(watcher, 1000)
+  assert ets.owner(table) == Ok(receiver)
+  assert ets.insert(table, 1, "after") == Ok(Nil)
+  assert ets.lookup(table, 1) == Ok(["after"])
+  assert ets.drop(table) == Ok(Nil)
+}

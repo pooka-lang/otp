@@ -1,0 +1,87 @@
+// SPDX-License-Identifier: Apache-2.0
+
+module statem_test
+
+import pooka/otp.{Name, Subject}
+import pooka/otp/statem
+import pooka/otp/supervisor
+
+enum Phase {
+  Closed,
+  Open
+}
+
+class Command {}
+
+class Push is Command {}
+
+class Unlock is Command {}
+
+class Tick is Command {}
+
+class Expire is Command {}
+
+class Read(reply: Subject(Int)) is Command
+
+_handle(phase: Phase, count: Int, command: Command) -> statem.Step(
+  Phase,
+  Int,
+  Command
+) {
+  match command {
+    Push -> match phase {
+      Phase.Closed -> statem.stay(count).with_actions([statem.postpone()])
+      Phase.Open -> statem.stay(count + 1)
+    }
+    Unlock -> {
+      let tick: Command = Tick()
+      statem.transition(Phase.Open, count).with_actions([statem.internal(tick)])
+    }
+    Tick -> statem.stay(count + 10)
+    Expire -> statem.stay(count + 100)
+    Read(reply) -> {
+      otp.send(reply, count)
+      statem.stay(count)
+    }
+  }
+}
+
+test "postponed messages replay on transition after internal events" {
+  let assert Ok(machine) = statem.start(statem.spec(
+    fn(_) { Ok(#(Phase.Closed, 0, [])) },
+    _handle
+  ))
+  statem.send(machine, Push())
+  assert statem.call(machine, fn(reply) { Read(reply) }, 1000) == Ok(0)
+  statem.send(machine, Unlock())
+  assert statem.call(machine, fn(reply) { Read(reply) }, 1000) == Ok(11)
+  statem.shutdown(machine)
+}
+
+test "immediate state timeout becomes a typed event" {
+  let assert Ok(machine) = statem.start(statem.spec(
+    fn(_) {
+      let expire: Command = Expire()
+      Ok(#(Phase.Closed, 0, [statem.state_timeout(0, expire)]))
+    },
+    _handle
+  ))
+  assert statem.call(machine, fn(reply) { Read(reply) }, 1000) == Ok(100)
+  statem.shutdown(machine)
+}
+
+test "named state machines can start under a supervisor" {
+  let name: Name(Command) = otp.name("door")
+  let stopped = otp.new_subject()
+  let spec = statem.spec(fn(_) { Ok(#(Phase.Open, 3, [])) }, _handle)
+    .with_name(name)
+    .on_stop(fn(_, count, reason) { otp.send(stopped, #(count, reason)) })
+  let assert Ok(tree) = supervisor.start(supervisor.spec(
+    supervisor.Strategy.OneForOne,
+    [supervisor.statem("door", spec)]
+  ))
+  let door = statem.named(name)
+  assert statem.call(door, fn(reply) { Read(reply) }, 1000) == Ok(3)
+  supervisor.shutdown(tree)
+  assert otp.receive(stopped, 1000) == Some(#(3, "shutdown"))
+}
